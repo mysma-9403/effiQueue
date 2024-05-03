@@ -30,6 +30,7 @@ async fn main() {
             }
             Err(e) => {
                 eprintln!("Wystąpił błąd: {}", e);
+                continue;
             }
         }
         sleep(Duration::from_secs(10)).await;

@@ -29,12 +29,13 @@ pub async fn make_new_process_if_needed(config: &Config, queue_length: u32, mut 
     let ram_usage_percent = (memory_used as f64 / memory_total as f64) * 100.0;
 
     if queue_length == 0 {
-        kill_matching_processes(&config.process_name).await;
+        kill_matching_processes(&config.process_name, &process_counter).await;
     } else {
         println!("Sprawdzam czy robić process");
         if ram_usage_percent < config.max as f64 && queue_length > 40 {
             process_counter += 1;
-            let process_name = format!("{}_{:02}.sh", &config.process_name, process_counter);
+            let process_name_replace = config.process_name.replace("%(process_num)02d", &process_counter.to_string());
+            let process_name = format!("{}_{:02}.sh", process_name_replace, process_counter);
             let command = config.command.replace("%(process_num)02d", &process_counter.to_string());
 
             // Tworzenie pliku skryptu
@@ -62,28 +63,30 @@ pub async fn make_new_process_if_needed(config: &Config, queue_length: u32, mut 
     }
 }
 
-fn kill_matching_processes(command: &str) {
-    let pattern = format!("^{}", command);
-    if pattern.is_empty() {
-        return;
-    }
+async fn kill_matching_processes(command: &str, process_counter: &usize) {
+    if (process_counter > &0) {
+        let pattern = format!("^{}", command);
+        if pattern.is_empty() {
+            return;
+        }
 
-    println!("Zabijanie procesów pasujących do wzorca: '{}'", pattern);
+        println!("Zabijanie procesów pasujących do wzorca: '{}'", pattern);
 
-    let output = Command::new("pkill")
-        .arg("-f")
-        .arg(pattern.clone())
-        .output()
-        .expect("failed to execute process");
+        let output = Command::new("pkill")
+            .arg("-f")
+            .arg(pattern.clone())
+            .output()
+            .expect("failed to execute process");
 
-    if output.status.success() {
-        println!("Pomyślnie zabito procesy pasujące do wzorca: '{}'", pattern);
-    } else {
-        let error_message = String::from_utf8_lossy(&output.stderr);
-        eprintln!("Nie udało się zabić procesów pasujących do wzorca: '{}'. Błąd: {}", pattern, error_message);
-        match output.status.code() {
-            Some(code) => eprintln!("Kod błędu: {}", code),
-            None => eprintln!("Proces został zakończony przez sygnał"),
+        if output.status.success() {
+            println!("Pomyślnie zabito procesy pasujące do wzorca: '{}'", pattern);
+        } else {
+            let error_message = String::from_utf8_lossy(&output.stderr);
+            eprintln!("Nie udało się zabić procesów pasujących do wzorca: '{}'. Błąd: {}", pattern, error_message);
+            match output.status.code() {
+                Some(code) => eprintln!("Kod błędu: {}", code),
+                None => eprintln!("Proces został zakończony przez sygnał"),
+            }
         }
     }
 }

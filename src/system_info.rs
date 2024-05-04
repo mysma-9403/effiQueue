@@ -1,5 +1,3 @@
-// W pliku src/system_info.rs
-
 use sysinfo::{System, Component, Disk, NetworkData};
 
 pub struct SystemData {
@@ -11,8 +9,8 @@ pub struct SystemData {
 
 impl SystemData {
     pub fn new() -> Self {
-        let mut sys = System::new_all(); // Tworzy nową instancję `System` i zbiera informacje o wszystkim.
-        sys.refresh_all(); // Odświeża informacje o systemie.
+        let mut sys = System::new_all();
+        sys.refresh_all();
 
         let memory_used = sys.used_memory();
         let memory_total = sys.total_memory();

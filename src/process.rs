@@ -32,6 +32,7 @@ pub async fn make_new_process_if_needed(config: &Config, queue_length: u32, mut 
         kill_matching_processes(&config.process_name, &process_counter).await;
     } else {
         println!("Sprawdzam czy robić process");
+        println!("{}", process_counter);
         if ram_usage_percent < config.max as f64 && queue_length > 40 {
             process_counter += 1;
             let process_name_replace = config.process_name.replace("%(process_num)02d", &process_counter.to_string());

@@ -65,7 +65,7 @@ pub struct Config {
 }
 
 /// Raw, unvalidated shape read from disk.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 struct RawConfig {
     mode: Option<String>,
@@ -94,16 +94,71 @@ struct RawConfig {
     depth_threshold: Option<u32>,
     ram_ratio_cap: Option<f64>,
     metrics_addr: Option<String>,
+    /// TOML `[[program]]` array (multi-program mode). Absent for single-program / `.conf`.
+    #[serde(rename = "program")]
+    programs: Option<Vec<RawProgram>>,
 }
 
-/// Load, detect format, parse and validate a config file.
-pub fn load(path: &str) -> Result<Config, ConfigError> {
+/// Per-program overrides for multi-program mode (`[[program]]`). Any unset field
+/// falls back to the shared top-level value.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+struct RawProgram {
+    mode: Option<String>,
+    command: Option<String>,
+    process_name: Option<String>,
+    max_workers: Option<u32>,
+    min_workers: Option<u32>,
+    shell: Option<bool>,
+    queue: Option<String>,
+    queue_connection: Option<String>,
+    queue_name: Option<String>,
+    autostart: Option<bool>,
+    autorestart: Option<bool>,
+    slo_drain_time: Option<String>,
+    max: Option<u32>,
+}
+
+/// Load one or more program configs. A TOML file with `[[program]]` yields one
+/// [`Config`] per program (each carrying the shared global settings); anything
+/// else (single TOML or Supervisor `.conf`) yields a single-element vector.
+pub fn load_all(path: &str) -> Result<Vec<Config>, ConfigError> {
     let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
         path: path.to_string(),
         source: e,
     })?;
-    let raw = detect_and_parse(path, &text)?;
-    validate(raw)
+    let mut raw = detect_and_parse(path, &text)?;
+    match raw.programs.take() {
+        Some(list) if !list.is_empty() => list
+            .into_iter()
+            .map(|p| validate(merge_program(&raw, p)))
+            .collect(),
+        _ => Ok(vec![validate(raw)?]),
+    }
+}
+
+/// Build a full `RawConfig` for one program: program fields override the shared
+/// top-level defaults, which fill in everything else.
+fn merge_program(global: &RawConfig, p: RawProgram) -> RawConfig {
+    RawConfig {
+        mode: p.mode.or_else(|| global.mode.clone()),
+        command: p.command.or_else(|| global.command.clone()),
+        process_name: p.process_name.or_else(|| global.process_name.clone()),
+        max_workers: p.max_workers.or(global.max_workers),
+        min_workers: p.min_workers.or(global.min_workers),
+        shell: p.shell.or(global.shell),
+        queue: p.queue.or_else(|| global.queue.clone()),
+        queue_connection: p
+            .queue_connection
+            .or_else(|| global.queue_connection.clone()),
+        queue_name: p.queue_name.or_else(|| global.queue_name.clone()),
+        autostart: p.autostart.or(global.autostart),
+        autorestart: p.autorestart.or(global.autorestart),
+        slo_drain_time: p.slo_drain_time.or_else(|| global.slo_drain_time.clone()),
+        max: p.max.or(global.max),
+        programs: None,
+        ..global.clone()
+    }
 }
 
 fn detect_and_parse(path: &str, text: &str) -> Result<RawConfig, ConfigError> {
@@ -496,5 +551,33 @@ mod tests {
         assert_eq!(cfg.slo_drain_time, Some(Duration::from_secs(120)));
         assert_eq!(cfg.ram_headroom, Some(2 * 1024 * 1024 * 1024));
         assert_eq!(cfg.ram_budget, None);
+    }
+
+    #[test]
+    fn program_inherits_globals_and_overrides() {
+        let global = RawConfig {
+            mode: Some("threshold".into()),
+            queue_connection: Some("amqp://localhost".into()),
+            max_workers: Some(4),
+            ..Default::default()
+        };
+        let p1 = RawProgram {
+            command: Some("worker-a".into()),
+            queue_name: Some("qa".into()),
+            ..Default::default()
+        };
+        let p2 = RawProgram {
+            command: Some("worker-b".into()),
+            queue_name: Some("qb".into()),
+            max_workers: Some(8),
+            ..Default::default()
+        };
+        let c1 = validate(merge_program(&global, p1)).unwrap();
+        let c2 = validate(merge_program(&global, p2)).unwrap();
+        assert_eq!(c1.command, "worker-a");
+        assert_eq!(c1.queue_name, "qa");
+        assert_eq!(c1.max_workers, 4); // inherited from global
+        assert_eq!(c2.max_workers, 8); // program override
+        assert_eq!(c2.queue_connection, "amqp://localhost"); // shared global
     }
 }

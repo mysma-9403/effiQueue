@@ -1,0 +1,24 @@
+# Multi-program example: two programs sharing one host RAM budget.
+# Run:  effiqueue --config data/config.multi.toml
+
+# Shared globals (inherited by every [[program]] unless overridden):
+poll_interval = "10s"
+drain_timeout = "30s"
+ram_budget = "8GB"                              # shared across ALL programs
+metrics_addr = "127.0.0.1:9101"
+queue_connection = "amqp://guest:guest@localhost:5672"
+
+[[program]]
+process_name = "index_%(process_num)02d"
+command = "php /var/www/symfony/bin/console messenger:consume index_site --time-limit=3600"
+queue_name = "messages_index"
+mode = "slo"
+slo_drain_time = "120s"
+max_workers = 8
+
+[[program]]
+process_name = "mailer_%(process_num)02d"
+command = "php /var/www/symfony/bin/console messenger:consume mailer --time-limit=3600"
+queue_name = "messages_mail"
+mode = "threshold"
+max_workers = 4

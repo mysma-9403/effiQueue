@@ -1,16 +1,18 @@
 //! Minimal Prometheus `/metrics` exposition — no HTTP framework, one TCP task.
 //!
-//! Exposes the signature series (`workers_needed`, `workers_capacity`,
-//! `feasibility_gap`) alongside `mu`/`lambda`/`backlog`/`workers` and scale
-//! counters. Floats are stored as milli-units in atomics (no atomic f64).
+//! The control loop pushes a per-program snapshot each tick; the endpoint renders
+//! it with a `program="..."` label. Exposes the signature series
+//! (`workers_needed`, `workers_capacity`, `feasibility_gap`) plus
+//! `mu`/`lambda`/`backlog`/`workers` and scale counters.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-/// Snapshot pushed from the control loop each tick.
-pub struct Snapshot {
+/// One program's metric values for a tick.
+#[derive(Clone)]
+pub struct ProgramSnapshot {
+    pub name: String,
     pub workers: u64,
     pub backlog: u64,
     /// `-1` = not yet measured (SLO bootstrap) or threshold mode.
@@ -19,110 +21,112 @@ pub struct Snapshot {
     pub feasibility_gap: u64,
     pub mu: f64,
     pub lambda: f64,
+    pub scale_up_total: u64,
+    pub scale_down_total: u64,
 }
 
 #[derive(Default)]
 pub struct Metrics {
-    workers: AtomicU64,
-    backlog: AtomicU64,
-    workers_needed: AtomicI64,
-    workers_capacity: AtomicU64,
-    feasibility_gap: AtomicU64,
-    mu_milli: AtomicU64,
-    lambda_milli: AtomicU64,
-    scale_up_total: AtomicU64,
-    scale_down_total: AtomicU64,
+    programs: Mutex<Vec<ProgramSnapshot>>,
 }
 
 impl Metrics {
-    pub fn update(&self, s: &Snapshot) {
-        self.workers.store(s.workers, Ordering::Relaxed);
-        self.backlog.store(s.backlog, Ordering::Relaxed);
-        self.workers_needed
-            .store(s.workers_needed, Ordering::Relaxed);
-        self.workers_capacity
-            .store(s.workers_capacity, Ordering::Relaxed);
-        self.feasibility_gap
-            .store(s.feasibility_gap, Ordering::Relaxed);
-        self.mu_milli
-            .store((s.mu * 1000.0).max(0.0) as u64, Ordering::Relaxed);
-        self.lambda_milli
-            .store((s.lambda * 1000.0).max(0.0) as u64, Ordering::Relaxed);
-    }
-
-    pub fn inc_scale_up(&self) {
-        self.scale_up_total.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn inc_scale_down(&self) {
-        self.scale_down_total.fetch_add(1, Ordering::Relaxed);
+    /// Replace the current snapshot (called once per control-loop tick).
+    pub fn set(&self, snapshots: Vec<ProgramSnapshot>) {
+        *self.programs.lock().unwrap() = snapshots;
     }
 
     fn render(&self) -> String {
-        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
-        let mu = self.mu_milli.load(Ordering::Relaxed) as f64 / 1000.0;
-        let lambda = self.lambda_milli.load(Ordering::Relaxed) as f64 / 1000.0;
+        let progs = self.programs.lock().unwrap();
         let mut s = String::new();
-        let mut metric = |name: &str, kind: &str, help: &str, val: String| {
-            s.push_str(&format!(
-                "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {val}\n"
-            ));
-        };
-        metric(
+        block(
+            &mut s,
+            &progs,
             "effiqueue_workers",
             "gauge",
             "Number of live workers.",
-            g(&self.workers).to_string(),
+            |p| p.workers.to_string(),
         );
-        metric(
+        block(
+            &mut s,
+            &progs,
             "effiqueue_backlog",
             "gauge",
             "Queue depth (messages).",
-            g(&self.backlog).to_string(),
+            |p| p.backlog.to_string(),
         );
-        metric(
+        block(
+            &mut s,
+            &progs,
             "effiqueue_workers_needed",
             "gauge",
             "Workers per Little's Law (-1 = unknown).",
-            self.workers_needed.load(Ordering::Relaxed).to_string(),
+            |p| p.workers_needed.to_string(),
         );
-        metric(
+        block(
+            &mut s,
+            &progs,
             "effiqueue_workers_capacity",
             "gauge",
-            "Capacity per RAM budget.",
-            g(&self.workers_capacity).to_string(),
+            "Capacity from the RAM budget.",
+            |p| p.workers_capacity.to_string(),
         );
-        metric(
+        block(
+            &mut s,
+            &progs,
             "effiqueue_feasibility_gap",
             "gauge",
             "Missing workers (needed - capacity).",
-            g(&self.feasibility_gap).to_string(),
+            |p| p.feasibility_gap.to_string(),
         );
-        metric(
+        block(
+            &mut s,
+            &progs,
             "effiqueue_mu",
             "gauge",
             "Measured throughput per worker (msgs/s).",
-            format!("{mu}"),
+            |p| format!("{}", p.mu),
         );
-        metric(
+        block(
+            &mut s,
+            &progs,
             "effiqueue_lambda",
             "gauge",
             "Measured arrival rate (msgs/s).",
-            format!("{lambda}"),
+            |p| format!("{}", p.lambda),
         );
-        metric(
+        block(
+            &mut s,
+            &progs,
             "effiqueue_scale_up_total",
             "counter",
-            "Total number of scale-up actions.",
-            g(&self.scale_up_total).to_string(),
+            "Total scale-ups.",
+            |p| p.scale_up_total.to_string(),
         );
-        metric(
+        block(
+            &mut s,
+            &progs,
             "effiqueue_scale_down_total",
             "counter",
-            "Total number of scale-down actions.",
-            g(&self.scale_down_total).to_string(),
+            "Total scale-downs.",
+            |p| p.scale_down_total.to_string(),
         );
         s
+    }
+}
+
+fn block(
+    s: &mut String,
+    progs: &[ProgramSnapshot],
+    name: &str,
+    kind: &str,
+    help: &str,
+    val: impl Fn(&ProgramSnapshot) -> String,
+) {
+    s.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
+    for p in progs {
+        let label = p.name.replace('\\', "\\\\").replace('"', "\\\"");
+        s.push_str(&format!("{name}{{program=\"{label}\"}} {}\n", val(p)));
     }
 }
 
@@ -132,7 +136,7 @@ pub async fn serve(addr: String, metrics: Arc<Metrics>) {
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!(%addr, error = %e, "failed to open the metrics endpoint");
+            tracing::error!(%addr, error = %e, "failed to bind the metrics endpoint");
             return;
         }
     };

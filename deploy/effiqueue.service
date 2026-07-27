@@ -1,0 +1,24 @@
+[Unit]
+Description=effiQueue — queue worker autoscaler
+Documentation=https://github.com/mysma-9403/effiQueue
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=effiqueue
+Group=effiqueue
+ExecStart=/usr/local/bin/effiqueue --config /etc/effiqueue/config.toml
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+# Hardening (relax ReadWritePaths to whatever the spawned workers need).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/effiqueue
+
+[Install]
+WantedBy=multi-user.target

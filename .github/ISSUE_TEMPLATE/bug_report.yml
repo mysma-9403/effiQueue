@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a problem with effiQueue
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Note: effiQueue is alpha. Worker counting/scaling are the core — please
+        include your config and logs (`RUST_LOG=debug`).
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      placeholder: "0.1.0-alpha or git SHA"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options: [Linux, macOS, Windows]
+    validations:
+      required: true
+  - type: input
+    id: install
+    attributes:
+      label: How installed
+      placeholder: "cargo build / release binary / Docker"
+  - type: input
+    id: rabbitmq
+    attributes:
+      label: RabbitMQ version
+  - type: textarea
+    id: config
+    attributes:
+      label: Config (redact secrets)
+      render: toml
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs. actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (RUST_LOG=debug)
+      render: shell

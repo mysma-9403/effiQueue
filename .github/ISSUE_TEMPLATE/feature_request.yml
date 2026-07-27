@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest an idea for effiQueue
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What are you trying to do that effiQueue can't today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: e.g. Supervisor, KEDA, Laravel Horizon, a custom script.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      description: effiQueue is a small single-host, non-orchestrator autoscaler.
+      options:
+        - label: This fits that scope (not container orchestration / multi-host scheduling).

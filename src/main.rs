@@ -129,6 +129,8 @@ fn emit_feasibility_gap(program: &str, gap: &policy::FeasibilityGap, mu: Option<
 /// Per-program runtime state carried across ticks.
 struct Prog {
     cfg: config::Config,
+    name: Arc<str>,
+    source: rabbitmq_connector::RabbitSource,
     pool: worker::WorkerPool,
     est: policy::Estimators,
     running_in_window: u32,
@@ -156,9 +158,16 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
             let pool =
                 worker::WorkerPool::new(cfg.command.clone(), cfg.process_name.clone(), cfg.shell);
             let est = policy::Estimators::new(cfg.alpha_mu, cfg.alpha_lambda);
+            let source = rabbitmq_connector::RabbitSource::new(
+                cfg.queue_connection.clone(),
+                cfg.queue_name.clone(),
+            );
+            let name: Arc<str> = Arc::from(cfg.process_name.as_str());
             let ticks = cfg.cooldown_ticks;
             Prog {
                 cfg,
+                name,
+                source,
                 pool,
                 est,
                 running_in_window: 0,
@@ -178,25 +187,38 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
     let mut probe = system_info::ResourceProbe::new();
 
     loop {
-        let host = probe.host_memory();
-
         for p in progs.iter_mut() {
             for (id, status) in p.pool.reap_exited() {
                 tracing::info!(program = %p.cfg.process_name, worker_id = id, ?status, "worker exited on its own");
             }
         }
 
+        // Only slo-mode programs need per-worker RSS.
+        let need_rss = progs.iter().any(|p| p.cfg.mode == config::Mode::Slo);
+        let all_pids: Vec<u32> = progs.iter().flat_map(|p| p.pool.pids()).collect();
+
+        // Run the blocking sysinfo scans off the async executor, in one section.
+        let (host, rss_map) = tokio::task::block_in_place(|| {
+            let host = probe.host_memory();
+            let rss = if need_rss {
+                probe.worker_rss_batch(&all_pids)
+            } else {
+                std::collections::HashMap::new()
+            };
+            (host, rss)
+        });
+
         // Per-program pool RSS (basis for the shared, host-wide RAM budget).
-        let mut prog_rss: Vec<u64> = Vec::with_capacity(progs.len());
-        for p in progs.iter() {
-            let rss: u64 = p
-                .pool
-                .pids()
-                .iter()
-                .filter_map(|&pid| probe.worker_rss(pid))
-                .sum();
-            prog_rss.push(rss);
-        }
+        let prog_rss: Vec<u64> = progs
+            .iter()
+            .map(|p| {
+                p.pool
+                    .pids()
+                    .iter()
+                    .filter_map(|pid| rss_map.get(pid).copied())
+                    .sum()
+            })
+            .collect();
         let total_worker_rss: u64 = prog_rss.iter().sum();
         let safe_ram_budget = ram_pool_budget(ram_budget, ram_headroom, &host, total_worker_rss);
         let swap_pressure =
@@ -227,19 +249,14 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
             let this_rss = prog_rss[idx];
             let worker_rss = (running > 0).then(|| this_rss / running as u64);
 
-            let backlog = match rabbitmq_connector::get_queue_message_count(
-                &p.cfg.queue_connection,
-                &p.cfg.queue_name,
-            )
-            .await
-            {
-                Ok(q) => q.length,
+            let backlog = match p.source.queue_depth().await {
+                Ok(depth) => depth,
                 Err(e) => {
                     tracing::warn!(program = %p.cfg.process_name, error = %e, "MetricSource/RabbitMQ error; skipping this program this tick");
                     p.running_in_window = running;
                     p.expected_running = running;
                     snapshots.push(metrics::ProgramSnapshot {
-                        name: p.cfg.process_name.clone(),
+                        name: p.name.clone(),
                         workers: running as u64,
                         backlog: 0,
                         workers_needed: -1,
@@ -351,7 +368,7 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
             p.expected_running = running_after;
 
             snapshots.push(metrics::ProgramSnapshot {
-                name: p.cfg.process_name.clone(),
+                name: p.name.clone(),
                 workers: running_after as u64,
                 backlog: backlog as u64,
                 workers_needed: m_needed,

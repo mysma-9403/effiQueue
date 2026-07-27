@@ -2,8 +2,10 @@
 //!
 //! One reusable [`System`] instance (no per-cycle reallocation). All values are
 //! in BYTES on every OS. Per-PID RSS is the foundation for `workers_capacity`
-//! in the Phase 1 SLO controller.
+//! in the Phase 1 SLO controller. Scans are blocking; callers wrap them in
+//! `tokio::task::block_in_place`.
 
+use std::collections::HashMap;
 use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 /// Host memory/swap snapshot, in bytes.
@@ -40,12 +42,22 @@ impl ResourceProbe {
         }
     }
 
-    /// RSS of a single worker (bytes), if the process is alive.
-    pub fn worker_rss(&mut self, pid: u32) -> Option<u64> {
-        let p = Pid::from_u32(pid);
+    /// RSS (bytes) of the given worker PIDs, sampled with a SINGLE process
+    /// refresh. Dead/missing PIDs are simply absent from the map.
+    pub fn worker_rss_batch(&mut self, pids: &[u32]) -> HashMap<u32, u64> {
+        if pids.is_empty() {
+            return HashMap::new();
+        }
+        let sysinfo_pids: Vec<Pid> = pids.iter().map(|&p| Pid::from_u32(p)).collect();
         self.sys
-            .refresh_processes(ProcessesToUpdate::Some(&[p]), true);
-        self.sys.process(p).map(|proc| proc.memory())
+            .refresh_processes(ProcessesToUpdate::Some(&sysinfo_pids), true);
+        let mut out = HashMap::with_capacity(pids.len());
+        for &p in pids {
+            if let Some(proc) = self.sys.process(Pid::from_u32(p)) {
+                out.insert(p, proc.memory());
+            }
+        }
+        out
     }
 }
 

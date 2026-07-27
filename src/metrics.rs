@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 /// One program's metric values for a tick.
 #[derive(Clone)]
 pub struct ProgramSnapshot {
-    pub name: String,
+    pub name: Arc<str>,
     pub workers: u64,
     pub backlog: u64,
     /// `-1` = not yet measured (SLO bootstrap) or threshold mode.

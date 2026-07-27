@@ -71,55 +71,55 @@ impl Metrics {
         metric(
             "effiqueue_workers",
             "gauge",
-            "Liczba żywych workerów.",
+            "Number of live workers.",
             g(&self.workers).to_string(),
         );
         metric(
             "effiqueue_backlog",
             "gauge",
-            "Głębokość kolejki (wiadomości).",
+            "Queue depth (messages).",
             g(&self.backlog).to_string(),
         );
         metric(
             "effiqueue_workers_needed",
             "gauge",
-            "Workery wg prawa Little'a (-1 = nieznane).",
+            "Workers per Little's Law (-1 = unknown).",
             self.workers_needed.load(Ordering::Relaxed).to_string(),
         );
         metric(
             "effiqueue_workers_capacity",
             "gauge",
-            "Pojemność wg budżetu RAM.",
+            "Capacity per RAM budget.",
             g(&self.workers_capacity).to_string(),
         );
         metric(
             "effiqueue_feasibility_gap",
             "gauge",
-            "Brakujące workery (needed - capacity).",
+            "Missing workers (needed - capacity).",
             g(&self.feasibility_gap).to_string(),
         );
         metric(
             "effiqueue_mu",
             "gauge",
-            "Zmierzona przepustowość na workera (msgs/s).",
+            "Measured throughput per worker (msgs/s).",
             format!("{mu}"),
         );
         metric(
             "effiqueue_lambda",
             "gauge",
-            "Zmierzone tempo napływu (msgs/s).",
+            "Measured arrival rate (msgs/s).",
             format!("{lambda}"),
         );
         metric(
             "effiqueue_scale_up_total",
             "counter",
-            "Łączna liczba scale-up.",
+            "Total number of scale-up actions.",
             g(&self.scale_up_total).to_string(),
         );
         metric(
             "effiqueue_scale_down_total",
             "counter",
-            "Łączna liczba scale-down.",
+            "Total number of scale-down actions.",
             g(&self.scale_down_total).to_string(),
         );
         s
@@ -132,16 +132,16 @@ pub async fn serve(addr: String, metrics: Arc<Metrics>) {
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!(%addr, error = %e, "nie udało się otworzyć endpointu metryk");
+            tracing::error!(%addr, error = %e, "failed to open the metrics endpoint");
             return;
         }
     };
-    tracing::info!(%addr, "endpoint metryk Prometheus: GET /metrics");
+    tracing::info!(%addr, "Prometheus metrics endpoint: GET /metrics");
     loop {
         let (mut sock, _) = match listener.accept().await {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!(error = %e, "błąd accept na endpointcie metryk");
+                tracing::warn!(error = %e, "accept error on the metrics endpoint");
                 continue;
             }
         };

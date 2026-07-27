@@ -2,7 +2,7 @@
 //!
 //! One reusable [`System`] instance (no per-cycle reallocation). All values are
 //! in BYTES on every OS. Per-PID RSS is the foundation for `workers_capacity`
-//! in the Faza 1 SLO controller.
+//! in the Phase 1 SLO controller.
 
 use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 

@@ -32,7 +32,7 @@ pub async fn get_queue_message_count(
     tracing::debug!(
         queue = queue_name,
         count = queue.message_count(),
-        "odczyt głębokości kolejki"
+        "read queue depth"
     );
 
     Ok(Queue {

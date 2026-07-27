@@ -1,15 +1,15 @@
-# Przykład trybu SLO (Budget-Bound SLO Controller + Feasibility Gap).
-# Uruchom:  effiqueue --config data/config.slo.toml
+# Example of SLO mode (Budget-Bound SLO Controller + Feasibility Gap).
+# Run:  effiqueue --config data/config.slo.toml
 
 mode = "slo"
 
 command = "php /var/www/symfony/bin/console messenger:consume index_site --time-limit=3600"
 process_name = "consumer_%(process_num)02d"
 
-# Deklarowany cel: rozładuj backlog w tym czasie (główna gałka operatora).
+# Declared goal: drain the backlog within this time (the operator's main knob).
 slo_drain_time = "120s"
 
-# Dokładnie JEDNO z ram_budget / ram_headroom (tu: bezwzględny budżet RAM puli).
+# Exactly ONE of ram_budget / ram_headroom (here: an absolute RAM budget for the pool).
 ram_budget = "8GB"
 
 min_workers = 0
@@ -18,14 +18,14 @@ poll_interval = "10s"
 drain_timeout = "30s"
 shell = false
 
-# Strojenie estymatorów i kontrolera (opcjonalne — pokazane wartości domyślne).
+# Estimator and controller tuning (optional — defaults shown).
 alpha_mu = 0.3
 alpha_lambda = 0.3
 hysteresis = 1
 cooldown_ticks = 2
 spike_backlog = 1000
 
-# Endpoint metryk Prometheus (opcjonalny). GET /metrics.
+# Prometheus metrics endpoint (optional). GET /metrics.
 metrics_addr = "127.0.0.1:9101"
 
 queue = "rabbitmq"

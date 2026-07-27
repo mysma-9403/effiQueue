@@ -1,6 +1,6 @@
 //! Worker lifecycle: spawn processes directly by argv (no shell, no generated
 //! `.sh`), keep the [`Child`] handle so identity is by PID, and stop workers
-//! through the platform abstraction. Foundation for the Faza 1 SLO controller
+//! through the platform abstraction. Foundation for the Phase 1 SLO controller
 //! (per-PID RSS in `spawn_rss`, exit reaping for autorestart).
 
 use crate::platform::{self, StopOutcome};
@@ -17,21 +17,21 @@ pub struct TrackedWorker {
     pub name: String,
     /// Retained handle — the source of PID + kill, dropped in the old code.
     pub child: Child,
-    /// RSS (bytes) sampled shortly after spawn. Foundation for Faza 1. TODO Faza 1.
+    /// RSS (bytes) sampled shortly after spawn. Foundation for Phase 1. TODO Phase 1.
     #[allow(dead_code)]
     pub spawn_rss: Option<u64>,
-    /// When the worker started. Foundation for age/backoff. TODO Faza 1.
+    /// When the worker started. Foundation for age/backoff. TODO Phase 1.
     #[allow(dead_code)]
     pub started_at: Instant,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
-    #[error("pusta linia poleceń po sparsowaniu przez shell-words")]
+    #[error("empty command line after shell-words parsing")]
     EmptyCommand,
-    #[error("błąd parsowania 'command': {0}")]
+    #[error("failed to parse 'command': {0}")]
     Parse(String),
-    #[error("nie udało się uruchomić procesu: {0}")]
+    #[error("failed to spawn process: {0}")]
     Spawn(#[source] std::io::Error),
 }
 
@@ -96,7 +96,7 @@ impl TrackedWorker {
         #[cfg(windows)]
         tracing::warn!(
             pid = self.pid,
-            "graceful drain nie jest osiągalny na Windows; po drain_timeout nastąpi Child.kill() (TerminateProcess) — możliwa utrata wiadomości in-flight"
+            "graceful drain is not available on Windows; after drain_timeout Child.kill() (TerminateProcess) is used — in-flight messages may be lost"
         );
 
         let deadline = Instant::now() + drain_timeout;
@@ -162,7 +162,7 @@ impl WorkerPool {
         let id = self.next_id;
         let w = TrackedWorker::spawn(id, &self.command, &self.name_template, self.shell)?;
         let pid = w.pid;
-        tracing::info!(worker_id = id, name = %w.name, pid, "uruchomiono workera");
+        tracing::info!(worker_id = id, name = %w.name, pid, "started worker");
         self.next_id += 1;
         self.workers.push(w);
         Ok(pid)
@@ -172,17 +172,12 @@ impl WorkerPool {
     pub async fn stop_one(&mut self, drain_timeout: Duration) -> Option<StopOutcome> {
         let mut w = self.workers.pop()?;
         let outcome = w.request_stop(drain_timeout).await;
-        tracing::info!(
-            worker_id = w.id,
-            pid = w.pid,
-            ?outcome,
-            "zatrzymano workera"
-        );
+        tracing::info!(worker_id = w.id, pid = w.pid, ?outcome, "stopped worker");
         Some(outcome)
     }
 
     /// Remove workers that exited on their own (crash or self-exit).
-    /// Foundation for autorestart (Faza 1).
+    /// Foundation for autorestart (Phase 1).
     pub fn reap_exited(&mut self) -> Vec<(u32, std::process::ExitStatus)> {
         let mut dead = Vec::new();
         let mut i = 0;

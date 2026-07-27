@@ -10,15 +10,15 @@ use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("nie można odczytać pliku konfiguracji {path}: {source}")]
+    #[error("failed to read config file {path}: {source}")]
     Io {
         path: String,
         #[source]
         source: std::io::Error,
     },
-    #[error("błąd składni konfiguracji: {0}")]
+    #[error("config syntax error: {0}")]
     Parse(String),
-    #[error("nieprawidłowa wartość dla '{key}': {reason}")]
+    #[error("invalid value for '{key}': {reason}")]
     Invalid { key: String, reason: String },
 }
 
@@ -176,7 +176,7 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
     let max_workers = match (raw.max_workers, raw.max) {
         (Some(mw), Some(_)) => {
             tracing::warn!(
-                "podano jednocześnie 'max' i 'max_workers'; używam max_workers, ignoruję 'max'"
+                "both 'max' and 'max_workers' were provided; using max_workers, ignoring 'max'"
             );
             mw
         }
@@ -184,21 +184,21 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         (None, Some(legacy)) => {
             tracing::warn!(
                 value = legacy,
-                "klucz 'max' jest przestarzały; mapuję na max_workers (pierwotnie oznaczał limit RAM %, zweryfikuj konfigurację)"
+                "key 'max' is deprecated; mapping to max_workers (it originally meant a RAM % limit, please verify your config)"
             );
             legacy
         }
         (None, None) => {
             return Err(ConfigError::Invalid {
                 key: "max_workers".into(),
-                reason: "pole wymagane".into(),
+                reason: "required field".into(),
             })
         }
     };
     if max_workers == 0 {
         return Err(ConfigError::Invalid {
             key: "max_workers".into(),
-            reason: "musi być > 0".into(),
+            reason: "must be > 0".into(),
         });
     }
     let min_workers = raw.min_workers.unwrap_or(0);
@@ -215,7 +215,7 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         Some(other) => {
             return Err(ConfigError::Invalid {
                 key: "mode".into(),
-                reason: format!("nieznany tryb '{other}' (slo|threshold)"),
+                reason: format!("unknown mode '{other}' (slo|threshold)"),
             })
         }
     };
@@ -236,16 +236,16 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
     let slo_drain_time = if mode == Mode::Slo {
         let slo = slo_drain_time.ok_or_else(|| ConfigError::Invalid {
             key: "slo_drain_time".into(),
-            reason: "wymagane w trybie slo".into(),
+            reason: "required in slo mode".into(),
         })?;
         match (ram_budget, ram_headroom) {
             (Some(_), Some(_)) => {
                 return Err(ConfigError::Invalid {
                     key: "ram_budget/ram_headroom".into(),
-                    reason: "ustaw dokładnie jedno z ram_budget / ram_headroom".into(),
+                    reason: "set exactly one of ram_budget / ram_headroom".into(),
                 })
             }
-            (None, None) => ram_headroom = Some(2 * 1024 * 1024 * 1024), // domyślnie 2GB headroom
+            (None, None) => ram_headroom = Some(2 * 1024 * 1024 * 1024), // default 2GB headroom
             _ => {}
         }
         Some(slo)
@@ -259,7 +259,7 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         if !(a > 0.0 && a <= 1.0) {
             return Err(ConfigError::Invalid {
                 key: name.into(),
-                reason: "musi być w przedziale (0, 1]".into(),
+                reason: "must be in the range (0, 1]".into(),
             });
         }
     }
@@ -298,21 +298,21 @@ fn required(opt: Option<String>, key: &str) -> Result<String, ConfigError> {
     opt.filter(|s| !s.trim().is_empty())
         .ok_or_else(|| ConfigError::Invalid {
             key: key.into(),
-            reason: "pole wymagane".into(),
+            reason: "required field".into(),
         })
 }
 
 fn parse_u32(s: &str, key: &str) -> Result<u32, ConfigError> {
     s.trim().parse().map_err(|_| ConfigError::Invalid {
         key: key.into(),
-        reason: format!("oczekiwano liczby całkowitej, otrzymano '{s}'"),
+        reason: format!("expected an integer, got '{s}'"),
     })
 }
 
 fn parse_f64(s: &str, key: &str) -> Result<f64, ConfigError> {
     s.trim().parse().map_err(|_| ConfigError::Invalid {
         key: key.into(),
-        reason: format!("oczekiwano liczby, otrzymano '{s}'"),
+        reason: format!("expected a number, got '{s}'"),
     })
 }
 
@@ -322,7 +322,7 @@ fn parse_bool(s: &str, key: &str) -> Result<bool, ConfigError> {
         "false" | "0" | "no" | "off" => Ok(false),
         other => Err(ConfigError::Invalid {
             key: key.into(),
-            reason: format!("oczekiwano wartości logicznej, otrzymano '{other}'"),
+            reason: format!("expected a boolean, got '{other}'"),
         }),
     }
 }
@@ -334,7 +334,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, ConfigError> {
     let (num, unit) = s.split_at(split);
     let n: u64 = num.parse().map_err(|_| ConfigError::Invalid {
         key: "duration".into(),
-        reason: format!("nieprawidłowa liczba w '{s}'"),
+        reason: format!("invalid number in '{s}'"),
     })?;
     let mult = match unit.trim() {
         "" | "s" => 1,
@@ -343,7 +343,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, ConfigError> {
         other => {
             return Err(ConfigError::Invalid {
                 key: "duration".into(),
-                reason: format!("nieznana jednostka '{other}' (użyj s/m/h)"),
+                reason: format!("unknown unit '{other}' (use s/m/h)"),
             })
         }
     };
@@ -357,7 +357,7 @@ pub fn parse_bytes(s: &str) -> Result<u64, ConfigError> {
     let (num, unit) = s.split_at(split);
     let n: u64 = num.parse().map_err(|_| ConfigError::Invalid {
         key: "bytes".into(),
-        reason: format!("nieprawidłowa liczba w '{s}'"),
+        reason: format!("invalid number in '{s}'"),
     })?;
     let mult: u64 = match unit.trim().to_ascii_uppercase().as_str() {
         "" | "B" => 1,
@@ -368,7 +368,7 @@ pub fn parse_bytes(s: &str) -> Result<u64, ConfigError> {
         other => {
             return Err(ConfigError::Invalid {
                 key: "bytes".into(),
-                reason: format!("nieznana jednostka '{other}' (użyj KB/MB/GB/TB)"),
+                reason: format!("unknown unit '{other}' (use KB/MB/GB/TB)"),
             })
         }
     };

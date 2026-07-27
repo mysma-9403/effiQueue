@@ -13,10 +13,10 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(name = "effiqueue", version, about)]
 struct Cli {
-    /// Ścieżka do konfiguracji (TOML lub Supervisor-style .conf).
+    /// Path to the configuration (TOML or Supervisor-style .conf).
     #[arg(long, default_value = "./data/config.conf")]
     config: String,
-    /// Nadpisanie trybu kontrolera (slo|threshold).
+    /// Override the controller mode (slo|threshold).
     #[arg(long)]
     mode: Option<String>,
     #[command(subcommand)]
@@ -25,9 +25,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Uruchom pętlę kontrolną (domyślne).
+    /// Run the control loop (default).
     Run,
-    /// Zwaliduj konfigurację i wyjdź.
+    /// Validate the configuration and exit.
     ValidateConfig,
 }
 
@@ -46,14 +46,14 @@ async fn main() -> anyhow::Result<()> {
         cfg.mode = match m {
             "slo" => config::Mode::Slo,
             "threshold" => config::Mode::Threshold,
-            other => anyhow::bail!("nieznany --mode '{other}' (dozwolone: slo|threshold)"),
+            other => anyhow::bail!("unknown --mode '{other}' (allowed: slo|threshold)"),
         };
     }
 
     match cli.command.unwrap_or(Cmd::Run) {
         Cmd::ValidateConfig => {
             log_config(&cfg);
-            tracing::info!("konfiguracja poprawna");
+            tracing::info!("configuration is valid");
             Ok(())
         }
         Cmd::Run => run(cfg).await,
@@ -78,7 +78,7 @@ fn log_config(cfg: &config::Config) {
         slo_drain_time = ?cfg.slo_drain_time,
         ram_budget = ?cfg.ram_budget,
         ram_headroom = ?cfg.ram_headroom,
-        "efektywna konfiguracja"
+        "effective configuration"
     );
 }
 
@@ -98,7 +98,7 @@ fn slo_ram_budget(cfg: &config::Config, host: &system_info::SystemData, pool_rss
 fn emit_feasibility_gap(gap: &policy::FeasibilityGap, mu: Option<f64>, lambda: f64) {
     let best_drain = match gap.best_drain {
         Some(d) => format!("{:.0}s", d.as_secs_f64()),
-        None => "nieskończoność (nie nadąża: mu*capacity <= lambda)".to_string(),
+        None => "infinity (cannot keep up: mu*capacity <= lambda)".to_string(),
     };
     tracing::warn!(
         workers_needed = gap.workers_needed,
@@ -109,12 +109,12 @@ fn emit_feasibility_gap(gap: &policy::FeasibilityGap, mu: Option<f64>, lambda: f
         mu = ?mu,
         lambda,
         slo_s = gap.slo_drain_time.as_secs(),
-        "feasibility_gap: SLO fizycznie nieosiągalny na tym hoście"
+        "feasibility_gap: SLO is physically unreachable on this host"
     );
 }
 
 async fn run(cfg: config::Config) -> anyhow::Result<()> {
-    tracing::info!("start effiQueue");
+    tracing::info!("starting effiQueue");
     log_config(&cfg);
     let mut pool =
         worker::WorkerPool::new(cfg.command.clone(), cfg.process_name.clone(), cfg.shell);
@@ -140,7 +140,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         let host = probe.host_memory();
 
         for (id, status) in pool.reap_exited() {
-            tracing::info!(worker_id = id, ?status, "worker zakończył się samodzielnie");
+            tracing::info!(worker_id = id, ?status, "worker exited on its own");
         }
 
         let running = pool.len() as u32;
@@ -161,7 +161,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
             swap_total_gib = bytes_to_gib(host.total_swap),
             workers = running,
             pool_rss_gib = bytes_to_gib(pool_rss),
-            "stan hosta i puli"
+            "host and pool state"
         );
 
         let backlog = match rabbitmq_connector::get_queue_message_count(
@@ -178,7 +178,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
                 tracing::warn!(
                     error = %e,
                     backoff_ms = backoff.as_millis() as u64,
-                    "błąd MetricSource/RabbitMQ; ponawiam z backoffem"
+                    "MetricSource/RabbitMQ error; retrying with backoff"
                 );
                 tokio::time::sleep(backoff).await;
                 backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
@@ -222,7 +222,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
                     workers_needed = ?d.workers_needed,
                     workers_capacity = d.workers_capacity,
                     action = ?d.action,
-                    "decyzja SLO"
+                    "SLO decision"
                 );
                 let needed = d.workers_needed.map(|n| n as i64).unwrap_or(-1);
                 let gap = d
@@ -252,7 +252,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
                         ram_ratio,
                     },
                 );
-                tracing::debug!(backlog, running, ram_ratio, action = ?a, "decyzja threshold");
+                tracing::debug!(backlog, running, ram_ratio, action = ?a, "threshold decision");
                 (a, -1i64, 0u64, 0u64)
             }
         };
@@ -270,7 +270,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         match action {
             policy::ScalingAction::ScaleUp => {
                 if let Err(e) = pool.spawn_one() {
-                    tracing::error!(error = %e, "nie udało się uruchomić workera");
+                    tracing::error!(error = %e, "failed to start worker");
                 }
                 metrics.inc_scale_up();
                 ticks_since_change = 0;
@@ -291,7 +291,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         tokio::select! {
             _ = tokio::time::sleep(dt) => {}
             _ = tokio::signal::ctrl_c() => {
-                tracing::info!(workers = pool.len(), "otrzymano sygnał zatrzymania; wygaszam workery");
+                tracing::info!(workers = pool.len(), "shutdown signal received; draining workers");
                 if !pool.is_empty() {
                     pool.shutdown_all(cfg.drain_timeout).await;
                 }

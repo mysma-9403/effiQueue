@@ -1,0 +1,7 @@
+# RabbitMQ for local testing:  docker compose -f examples/docker-compose.yml up -d
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # management UI / HTTP API

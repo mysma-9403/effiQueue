@@ -1,1 +1,8 @@
 /target
+/consumer_*.sh
+.idea/
+.vscode/
+.DS_Store
+*.log
+.claude/
+docs/

@@ -31,3 +31,10 @@ metrics_addr = "127.0.0.1:9101"
 queue = "rabbitmq"
 queue_connection = "amqp://guest:guest@localhost:5672"
 queue_name = "messages_low"
+
+# Preferred source of mu/lambda: the RabbitMQ management API. By default the
+# endpoint is derived from queue_connection (same host + credentials, port
+# 15672). Set management = false to stay on AMQP only, in which case mu is
+# inferred by perturbation regression instead (slower to converge).
+management = true
+# management_url = "http://guest:guest@localhost:15672"

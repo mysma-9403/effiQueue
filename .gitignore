@@ -5,4 +5,5 @@
 .DS_Store
 *.log
 .claude/
-docs/
+# PLAN.md is a personal roadmap; DESIGN.md is part of the project.
+docs/PLAN.md

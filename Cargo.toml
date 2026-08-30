@@ -1,13 +1,17 @@
 [package]
 name = "effiqueue"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
-description = "The queue autoscaler that knows your machine's capacity — a single-binary, cross-platform worker autoscaler driven by queue depth and a live RAM budget."
+description = "The queue autoscaler that knows your machine's capacity — a single-binary, cross-platform worker autoscaler driven by measured throughput and a live RAM budget."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mysma-9403/effiQueue"
+homepage = "https://github.com/mysma-9403/effiQueue"
+documentation = "https://docs.rs/effiqueue"
+readme = "README.md"
 keywords = ["autoscaler", "rabbitmq", "queue", "worker", "supervisor"]
 categories = ["command-line-utilities"]
+exclude = [".github/", ".idea/", "target/"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "process", "net", "io-util"] }

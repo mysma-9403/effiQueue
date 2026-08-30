@@ -13,6 +13,11 @@ Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=info
 
+# effiQueue drains its workers on SIGTERM. Give it longer than drain_timeout so
+# systemd does not SIGKILL the group mid-drain.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
 # Hardening (relax ReadWritePaths to whatever the spawned workers need).
 NoNewPrivileges=true
 ProtectSystem=strict

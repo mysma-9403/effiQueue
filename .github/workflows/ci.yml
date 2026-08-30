@@ -5,6 +5,9 @@ on:
     branches: [master]
   pull_request:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   check:
     strategy:
@@ -21,8 +24,68 @@ jobs:
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: test
-        run: cargo test --all
+        run: cargo test --all --locked
       - name: build (release)
-        run: cargo build --release
+        run: cargo build --release --locked
+
+  # The MSRV claimed in Cargo.toml has to actually build.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: msrv
+        run: echo "version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --locked
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Packaging has to work before a tag is pushed, not after.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo package --locked --list
+      - run: cargo publish --locked --dry-run
+
+  # The end-to-end guard for the estimator. In slo mode this asserts mu is
+  # genuinely measured -- the failure mode that shipped in 0.1.0-alpha was
+  # invisible to unit tests of the old estimator but fails here immediately.
+  e2e:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [threshold, slo]
+    services:
+      rabbitmq:
+        image: rabbitmq:3-management
+        ports: ["5672:5672", "15672:15672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+      - name: smoke test (${{ matrix.mode }})
+        env:
+          MODE: ${{ matrix.mode }}
+          EQ_EXTERNAL_RABBIT: "1"
+        run: ./examples/e2e-smoke.sh

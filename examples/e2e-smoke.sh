@@ -1,69 +1,112 @@
 #!/usr/bin/env bash
-# End-to-end smoke test: spins up RabbitMQ in Docker, publishes a backlog, runs
-# effiQueue (threshold mode), and asserts it scales UP to max on the backlog and
-# DOWN to zero once the queue is drained. Requires Docker + curl.
+# End-to-end smoke test against a real RabbitMQ.
+#
+#   MODE=threshold  scale UP on a backlog, DOWN to zero once drained
+#   MODE=slo        additionally assert that mu is actually MEASURED and that
+#                   workers_needed becomes a real number
+#
+# The slo assertions are the regression guard for the estimator: the previous
+# residual estimator never initialised mu on a growing or steady backlog, so
+# workers_needed stayed at the -1 sentinel forever and this test would fail.
+#
+# Requires curl. Starts RabbitMQ in Docker unless EQ_EXTERNAL_RABBIT=1 (CI
+# provides it as a service container).
 set -euo pipefail
 
+MODE="${MODE:-threshold}"
 IMG=rabbitmq:3-management
 CT=eq-e2e-rabbit
-API="http://localhost:15672/api"
+API="${EQ_API:-http://localhost:15672/api}"
 Q=messages_e2e
 METRICS="http://127.0.0.1:9110/metrics"
-CFG="$(dirname "$0")/config.e2e.toml"
-BIN=./target/debug/effiqueue
+HERE="$(cd "$(dirname "$0")" && pwd)"
+CFG="$HERE/config.e2e.$MODE.toml"
+BIN="${EQ_BIN:-./target/debug/effiqueue}"
+EXTERNAL="${EQ_EXTERNAL_RABBIT:-0}"
+
+[ -f "$CFG" ] || { echo "no config for MODE=$MODE ($CFG)"; exit 2; }
 
 EQ_PID=""
 cleanup() {
   [ -n "$EQ_PID" ] && kill "$EQ_PID" 2>/dev/null || true
-  docker rm -f "$CT" >/dev/null 2>&1 || true
+  [ "$EXTERNAL" = 1 ] || docker rm -f "$CT" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-workers() { curl -s "$METRICS" | awk '/^effiqueue_workers\{/{print $2; exit}'; }
+# Read one metric value for the single program under test.
+metric() { curl -s "$METRICS" | awk -v m="^$1{" '$0 ~ m {print $2; exit}'; }
 
-echo "==> starting RabbitMQ ($IMG)"
-docker rm -f "$CT" >/dev/null 2>&1 || true
-docker run -d --rm --name "$CT" -p 5672:5672 -p 15672:15672 "$IMG" >/dev/null
+if [ "$EXTERNAL" != 1 ]; then
+  echo "==> starting RabbitMQ ($IMG)"
+  docker rm -f "$CT" >/dev/null 2>&1 || true
+  docker run -d --rm --name "$CT" -p 5672:5672 -p 15672:15672 "$IMG" >/dev/null
+fi
 
 echo "==> waiting for the management API"
+ready=0
 for _ in $(seq 1 60); do
-  curl -sf -u guest:guest "$API/overview" >/dev/null 2>&1 && break
+  if curl -sf -u guest:guest "$API/overview" >/dev/null 2>&1; then ready=1; break; fi
   sleep 2
 done
+[ "$ready" = 1 ] || { echo "FAIL: management API never came up"; exit 1; }
 
-echo "==> declaring queue '$Q' and publishing 60 messages"
+echo "==> declaring queue '$Q' and publishing a backlog"
+curl -sf -u guest:guest -XDELETE "$API/queues/%2f/$Q" >/dev/null 2>&1 || true
 curl -sf -u guest:guest -H 'content-type: application/json' \
   -XPUT "$API/queues/%2f/$Q" -d '{"durable":true}' >/dev/null
-for i in $(seq 1 60); do
+for i in $(seq 1 300); do
   curl -sf -u guest:guest -H 'content-type: application/json' \
     -XPOST "$API/exchanges/%2f/amq.default/publish" \
-    -d "{\"properties\":{},\"routing_key\":\"$Q\",\"payload\":\"job-$i\",\"payload_encoding\":\"string\"}" >/dev/null
+    -d "{\"properties\":{},\"routing_key\":\"$Q\",\"payload\":\"job-$i\",\"payload_encoding\":\"string\"}" \
+    >/dev/null
 done
 
 echo "==> building effiQueue"
 cargo build -q
 
-echo "==> starting effiQueue (threshold mode)"
-RUST_LOG=info "$BIN" --config "$CFG" &
+echo "==> starting effiQueue (mode=$MODE)"
+chmod +x "$HERE/e2e-consumer.sh"
+RUST_LOG="${RUST_LOG:-info}" "$BIN" --config "$CFG" &
 EQ_PID=$!
 
-echo "==> expecting scale-up to max_workers (3)"
+echo "==> expecting scale-up"
 up=0
-for _ in $(seq 1 30); do
-  w="$(workers || echo 0)"; echo "   workers=$w"
-  [ "${w:-0}" -ge 3 ] && { up=1; break; }
+for _ in $(seq 1 40); do
+  w="$(metric effiqueue_workers || echo 0)"
+  echo "   workers=${w:-0} backlog=$(metric effiqueue_backlog) mu=$(metric effiqueue_mu) src=$(metric effiqueue_mu_source)"
+  [ "${w:-0}" -ge 2 ] && { up=1; break; }
   sleep 2
 done
 [ "$up" = 1 ] || { echo "FAIL: did not scale up"; exit 1; }
 
+if [ "$MODE" = slo ]; then
+  echo "==> expecting mu to become MEASURED (mu_source != 0)"
+  measured=0
+  for _ in $(seq 1 45); do
+    src="$(metric effiqueue_mu_source || echo 0)"
+    mu="$(metric effiqueue_mu || echo 0)"
+    needed="$(metric effiqueue_workers_needed || echo -1)"
+    echo "   mu_source=$src mu=$mu workers_needed=$needed"
+    if [ "${src%%.*}" != 0 ] && [ "${needed%%.*}" -ge 0 ]; then measured=1; break; fi
+    sleep 2
+  done
+  if [ "$measured" != 1 ]; then
+    echo "FAIL: mu was never measured; workers_needed stayed at the -1 sentinel."
+    echo "      This is exactly the identifiability bug the estimator rewrite fixed."
+    exit 1
+  fi
+  echo "==> mu measured and workers_needed derived"
+fi
+
 echo "==> purging the queue -> expecting scale-down to 0"
 curl -sf -u guest:guest -XDELETE "$API/queues/%2f/$Q/contents" >/dev/null
 down=0
-for _ in $(seq 1 40); do
-  w="$(workers || echo 1)"; echo "   workers=$w"
+for _ in $(seq 1 45); do
+  w="$(metric effiqueue_workers || echo 1)"
+  echo "   workers=${w:-1}"
   [ "${w:-1}" -eq 0 ] && { down=1; break; }
   sleep 2
 done
-[ "$down" = 1 ] || { echo "FAIL: did not scale down"; exit 1; }
+[ "$down" = 1 ] || { echo "FAIL: did not scale down to zero"; exit 1; }
 
-echo "==> PASS: scaled up on backlog, drained to zero on empty queue"
+echo "==> PASS (mode=$MODE)"

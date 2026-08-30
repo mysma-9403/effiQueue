@@ -1,0 +1,21 @@
+# Config used by examples/e2e-smoke.sh with MODE=slo.
+#
+# The point of this run is to prove mu is actually MEASURED end-to-end: with the
+# management API reachable, effiqueue_mu_source becomes 1 (broker rates) and
+# workers_needed leaves its -1 "unknown" sentinel.
+mode = "slo"
+command = "sh examples/e2e-consumer.sh"
+shell = false
+process_name = "e2e_%(process_num)02d"
+queue_connection = "amqp://guest:guest@localhost:5672"
+queue_name = "messages_e2e"
+
+slo_drain_time = "60s"
+ram_budget = "1GB"
+min_workers = 0
+max_workers = 4
+poll_interval = "2s"
+drain_timeout = "5s"
+cooldown_ticks = 1
+hysteresis = 0
+metrics_addr = "127.0.0.1:9110"

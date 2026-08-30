@@ -1,6 +1,7 @@
-# Config used by examples/e2e-smoke.sh (threshold mode — deterministic).
+# Config used by examples/e2e-smoke.sh with MODE=threshold (deterministic).
 mode = "threshold"
-command = "sleep 3600"          # dummy worker; the test drives scaling via queue depth
+command = "sh examples/e2e-consumer.sh"
+shell = false
 process_name = "e2e_%(process_num)02d"
 queue_connection = "amqp://guest:guest@localhost:5672"
 queue_name = "messages_e2e"
@@ -9,4 +10,5 @@ min_workers = 0
 max_workers = 3
 poll_interval = "2s"
 drain_timeout = "5s"
+cooldown_ticks = 1
 metrics_addr = "127.0.0.1:9110"

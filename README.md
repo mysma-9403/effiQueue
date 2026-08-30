@@ -95,7 +95,7 @@ Download a binary for your platform from the
 (gnu/musl, x86_64/aarch64), macOS (Intel/Apple Silicon) and Windows. Each
 release ships `SHA256SUMS.txt`.
 
-Or build from source:
+Or build from source (Rust 1.88 or newer):
 
 ```sh
 cargo build --release

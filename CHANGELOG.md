@@ -13,6 +13,18 @@ fixes the bugs that were corrupting the same measurement, and adds the CI that
 would have caught the problem. **Anyone running 0.1.0-alpha in `slo` mode should
 upgrade** — see the note below for what it was actually doing.
 
+### Breaking
+
+- An unimplemented `queue` backend is now a startup error rather than being
+  accepted and ignored. The legacy Supervisor `.conf` path documents a `queue`
+  key, so a config carrying anything other than `rabbitmq` — which previously
+  ran fine, silently reading RabbitMQ regardless — will now refuse to start.
+  Set `queue = "rabbitmq"` or remove the key.
+- `rust-version` is now **1.88**. It previously claimed 1.75, which was never
+  true: the dependency graph has required a newer compiler for some time, and
+  the first run of the new MSRV job proved it. Holding a lower floor would mean
+  pinning `idna`/`icu` back to versions carrying RUSTSEC-2024-0421.
+
 ### Fixed
 
 - **`mu` and `lambda` are now identifiable.** Each control window gives one
@@ -95,6 +107,14 @@ upgrade** — see the note below for what it was actually doing.
   that the 0.1.0-alpha estimator would fail.
 - `docs/DESIGN.md` is now part of the repository (it was gitignored) and is in
   English, with the estimator section corrected.
+
+### Security
+
+- Refreshed `Cargo.lock`, which was pinning 2024-era versions of `tokio`,
+  `rustls`, `ring`, `idna` and `tracing-subscriber`. That cleared eight RUSTSEC
+  advisories (including RUSTSEC-2024-0336, RUSTSEC-2025-0009 and
+  RUSTSEC-2024-0421) and three yanked crates. `cargo audit` is now clean, and
+  runs in CI so it stays that way.
 
 ### Changed
 

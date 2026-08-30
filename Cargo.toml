@@ -2,7 +2,7 @@
 name = "effiqueue"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "The queue autoscaler that knows your machine's capacity — a single-binary, cross-platform worker autoscaler driven by measured throughput and a live RAM budget."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mysma-9403/effiQueue"

@@ -21,22 +21,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: resolve version
+        id: v
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="$GITHUB_REF_NAME"
+          fi
+          echo "tag=${tag#v}" >> "$GITHUB_OUTPUT"
       - name: tag matches Cargo.toml version
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          [ "${{ github.event_name }}" = "workflow_dispatch" ] && tag="${{ inputs.tag }}" && tag="${tag#v}"
           crate="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
-          echo "tag=$tag crate=$crate"
-          if [ "$tag" != "$crate" ]; then
-            echo "::error::tag v$tag does not match Cargo.toml version $crate"
+          echo "tag=${{ steps.v.outputs.tag }} crate=$crate"
+          if [ "${{ steps.v.outputs.tag }}" != "$crate" ]; then
+            echo "::error::tag v${{ steps.v.outputs.tag }} does not match Cargo.toml version $crate"
             exit 1
           fi
       - name: CHANGELOG has an entry for this version
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          [ "${{ github.event_name }}" = "workflow_dispatch" ] && tag="${{ inputs.tag }}" && tag="${tag#v}"
-          grep -q "^## \[$tag\]" CHANGELOG.md || {
-            echo "::error::CHANGELOG.md has no '## [$tag]' section"; exit 1; }
+          if ! grep -q "^## \[${{ steps.v.outputs.tag }}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${{ steps.v.outputs.tag }}]' section"
+            exit 1
+          fi
 
   build:
     needs: verify

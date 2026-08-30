@@ -33,8 +33,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Read one metric value for the single program under test.
-metric() { curl -s "$METRICS" | awk -v m="^$1{" '$0 ~ m {print $2; exit}'; }
+# Read one metric value for the single program under test. Matched as a literal
+# prefix, not a regex: "{" opens an interval expression in ERE, and the prefix
+# also has to exclude longer names (effiqueue_workers vs effiqueue_workers_needed).
+metric() { curl -s "$METRICS" | awk -v p="$1{" 'index($0, p) == 1 { print $2; exit }'; }
 
 if [ "$EXTERNAL" != 1 ]; then
   echo "==> starting RabbitMQ ($IMG)"

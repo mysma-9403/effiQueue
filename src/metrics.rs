@@ -38,11 +38,17 @@ pub struct Metrics {
 impl Metrics {
     /// Replace the current snapshot (called once per control-loop tick).
     pub fn set(&self, snapshots: Vec<ProgramSnapshot>) {
-        *self.programs.lock().unwrap() = snapshots;
+        *self.lock() = snapshots;
+    }
+
+    /// Recover from poisoning rather than propagating it: a panic elsewhere must
+    /// not turn every subsequent scrape into another panic.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<ProgramSnapshot>> {
+        self.programs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn render(&self) -> String {
-        let progs = self.programs.lock().unwrap();
+        let progs = self.lock();
         let mut s = String::new();
         block(
             &mut s,

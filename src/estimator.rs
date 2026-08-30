@@ -125,6 +125,11 @@ const MIN_SPREAD: f64 = 3.0;
 /// Sliding-window length. Long enough to average out bursty arrivals (validated
 /// down to ~50% arrival jitter), short enough to track drift.
 const DEFAULT_WINDOW: usize = 120;
+/// Windows a broker-measured estimate stays trusted after the broker stops
+/// answering. Beyond this the number is too old to steer by and `mu` reverts to
+/// unknown, which puts the controller back on the bootstrap path and re-arms
+/// probing.
+const DIRECT_GRACE_WINDOWS: u32 = 30;
 
 /// Live estimator for `mu` and `lambda`.
 #[derive(Debug, Clone)]
@@ -135,8 +140,8 @@ pub struct Estimator {
     last_backlog: Option<u32>,
     window: VecDeque<Sample>,
     capacity: usize,
-    /// Windows since the regression gate last opened (drives probing).
-    ticks_since_fit: u32,
+    /// Consecutive windows without broker rates. Zero while the broker answers.
+    direct_stale: u32,
 }
 
 impl Estimator {
@@ -152,7 +157,7 @@ impl Estimator {
             last_backlog: None,
             window: VecDeque::with_capacity(capacity),
             capacity,
-            ticks_since_fit: 0,
+            direct_stale: 0,
         }
     }
 
@@ -180,16 +185,34 @@ impl Estimator {
             if o.running > 0 && rates.ack_rate > 0.0 {
                 self.mu.update(rates.ack_rate / o.running as f64);
                 self.source = Source::Direct;
+                self.direct_stale = 0;
             }
-            self.last_backlog = Some(o.backlog);
             // Keep collecting regression samples so the fallback stays warm if
-            // the management API disappears mid-run.
+            // the management API disappears mid-run. `push_sample` advances the
+            // backlog baseline itself — doing it here first would difference the
+            // reading against itself and fill the window with zeros.
             self.push_sample(o, dt_s);
             return;
         }
 
+        // No broker rates this window.
         self.push_sample(o, dt_s);
-        self.refit();
+        let fitted = self.refit();
+
+        if fitted {
+            self.source = Source::Regression;
+            return;
+        }
+        if self.source == Source::Direct {
+            // The estimate is still the broker's, but the broker has gone quiet.
+            // Reporting it as `Direct` forever would misstate where the number
+            // came from AND permanently suppress probing, since a live direct
+            // source never needs one.
+            self.direct_stale = self.direct_stale.saturating_add(1);
+            if self.direct_stale > DIRECT_GRACE_WINDOWS {
+                self.source = Source::None;
+            }
+        }
     }
 
     /// Record a `(n, dB/dt)` pair, skipping windows that carry no usable signal.
@@ -224,10 +247,10 @@ impl Estimator {
     }
 
     /// Ordinary least squares of `y = lambda - mu*n` over the window.
-    fn refit(&mut self) {
-        self.ticks_since_fit = self.ticks_since_fit.saturating_add(1);
+    /// Returns whether a trustworthy fit was produced.
+    fn refit(&mut self) -> bool {
         if self.window.len() < MIN_SAMPLES {
-            return;
+            return false;
         }
         let count = self.window.len() as f64;
         let n_mean = self.window.iter().map(|s| s.n).sum::<f64>() / count;
@@ -236,7 +259,7 @@ impl Estimator {
 
         // `n` never moved enough — mu is not identifiable from this window.
         if sxx < MIN_SPREAD {
-            return;
+            return false;
         }
         let sxy: f64 = self
             .window
@@ -245,7 +268,7 @@ impl Estimator {
             .sum();
         let slope = sxy / sxx;
         if !slope.is_finite() {
-            return;
+            return false;
         }
         let mu_hat = -slope;
         let lambda_hat = y_mean - slope * n_mean;
@@ -254,15 +277,12 @@ impl Estimator {
         // not physics. Reject rather than publish a nonsense estimate.
         // `is_finite` runs first so the comparison below never sees a NaN.
         if !mu_hat.is_finite() || !lambda_hat.is_finite() || mu_hat <= 0.0 {
-            return;
+            return false;
         }
 
         self.mu.update(mu_hat);
         self.lambda.update(lambda_hat.max(0.0));
-        if self.source != Source::Direct {
-            self.source = Source::Regression;
-        }
-        self.ticks_since_fit = 0;
+        true
     }
 
     /// Measured throughput per worker, or `None` while it is not identifiable.
@@ -286,10 +306,11 @@ impl Estimator {
     /// observable: no estimate yet, and the window lacks the spread to produce
     /// one. The controller answers by stepping one worker up or down.
     pub fn needs_probe(&self) -> bool {
-        if self.source == Source::Direct || self.mu().is_some() {
+        // The broker is answering; there is nothing to identify.
+        if self.source == Source::Direct && self.direct_stale == 0 {
             return false;
         }
-        self.spread() < MIN_SPREAD
+        self.mu().is_none() && self.spread() < MIN_SPREAD
     }
 
     /// `sum (n_i - n_mean)^2` over the window — the identifiability budget.
@@ -317,6 +338,8 @@ mod tests {
         lambda: f64,
         backlog: f64,
         n: u32,
+        /// Worker count that was running during the window just ended.
+        n_window: u32,
         seed: u64,
     }
 
@@ -327,6 +350,7 @@ mod tests {
                 lambda,
                 backlog,
                 n,
+                n_window: n,
                 seed: 0x2545_F491_4F6C_DD1D,
             }
         }
@@ -340,7 +364,6 @@ mod tests {
         }
 
         fn run(&mut self, est: &mut Estimator, ticks: usize, perturb: bool, jitter: f64) {
-            let dt_s = DT.as_secs_f64();
             for _ in 0..ticks {
                 if perturb {
                     let step = self.rand();
@@ -350,29 +373,35 @@ mod tests {
                         self.n = (self.n + 1).min(40);
                     }
                 }
-                let n_window = self.n;
-                est.observe(&Observation {
-                    backlog: self.backlog as u32,
-                    running: n_window,
-                    dt: DT,
-                    interference: false,
-                    rates: None,
-                });
-                let lam = if jitter > 0.0 {
-                    (self.lambda * (1.0 + jitter * (self.rand() * 2.0 - 1.0))).max(0.0)
-                } else {
-                    self.lambda
-                };
-                self.backlog =
-                    (self.backlog + lam * dt_s - self.mu * n_window as f64 * dt_s).max(0.0);
-                // Keep the queue in a measurable range; a pinned-empty queue
-                // carries no capacity information by construction.
-                if self.backlog < 1.0 {
-                    self.backlog = 20_000.0;
-                }
-                if self.backlog > 400_000.0 {
-                    self.backlog = 20_000.0;
-                }
+                self.step(est, self.n, jitter);
+            }
+        }
+
+        /// One control window, ordered exactly as `main`'s loop orders it: the
+        /// backlog we see now moved under the worker count that was running
+        /// during the window that just ended, so that is what gets observed.
+        /// Pairing the reading with the *new* count instead inverts the fitted
+        /// slope whenever the count alternates.
+        fn step(&mut self, est: &mut Estimator, n_next: u32, jitter: f64) {
+            let dt_s = DT.as_secs_f64();
+            est.observe(&Observation {
+                backlog: self.backlog as u32,
+                running: self.n_window,
+                dt: DT,
+                interference: false,
+                rates: None,
+            });
+            let lam = if jitter > 0.0 {
+                (self.lambda * (1.0 + jitter * (self.rand() * 2.0 - 1.0))).max(0.0)
+            } else {
+                self.lambda
+            };
+            self.backlog = (self.backlog + lam * dt_s - self.mu * n_next as f64 * dt_s).max(0.0);
+            self.n_window = n_next;
+            // Keep the queue in a measurable range; a pinned-empty queue carries
+            // no capacity information by construction.
+            if self.backlog < 1.0 || self.backlog > 400_000.0 {
+                self.backlog = 20_000.0;
             }
         }
     }
@@ -521,6 +550,122 @@ mod tests {
         assert_eq!(est.mu(), Some(8.0)); // 80 acks/s across 10 workers
         assert_eq!(est.lambda(), 200.0);
         assert!(!est.needs_probe(), "direct measurement never needs a probe");
+    }
+
+    #[test]
+    fn direct_path_keeps_the_regression_window_usable() {
+        // While the broker answers, samples are still collected so the fallback
+        // is warm if the management API disappears mid-run. The baseline must be
+        // advanced exactly once per window — differencing a reading against
+        // itself would fill the window with zero slopes and quietly disarm the
+        // fallback at the moment it is needed.
+        let mut est = Estimator::new(0.5, 0.5);
+        let dt_s = DT.as_secs_f64();
+        let (mu_true, lambda_true) = (8.0, 200.0);
+        let mut backlog = 50_000.0;
+        // `n_window` is the count that was running during the window being
+        // reported, matching how `main` feeds the estimator.
+        let mut n_window = 10u32;
+
+        for i in 0..200u32 {
+            est.observe(&Observation {
+                backlog: backlog as u32,
+                running: n_window,
+                dt: DT,
+                interference: false,
+                rates: Some(BrokerRates {
+                    ack_rate: mu_true * n_window as f64,
+                    publish_rate: lambda_true,
+                }),
+            });
+            let n_next = if i % 2 == 0 { 11 } else { 10 };
+            backlog = (backlog + lambda_true * dt_s - mu_true * n_next as f64 * dt_s).max(1.0);
+            if backlog > 400_000.0 {
+                backlog = 20_000.0;
+            }
+            n_window = n_next;
+        }
+        assert_eq!(est.source(), Source::Direct);
+        assert_eq!(est.mu(), Some(8.0));
+        assert!(
+            est.spread() > 0.0,
+            "the regression window collected no spread while the broker was up"
+        );
+
+        // The broker goes away. The fallback must take over immediately, using
+        // the window filled while the broker was still answering.
+        for i in 0..5u32 {
+            est.observe(&Observation {
+                backlog: backlog as u32,
+                running: n_window,
+                dt: DT,
+                interference: false,
+                rates: None,
+            });
+            let n_next = if i % 2 == 0 { 11 } else { 10 };
+            backlog = (backlog + lambda_true * dt_s - mu_true * n_next as f64 * dt_s).max(1.0);
+            if backlog > 400_000.0 {
+                backlog = 20_000.0;
+            }
+            n_window = n_next;
+        }
+        assert_close(est.mu(), 8.0, 1.0, "mu after the broker went away");
+        assert_eq!(
+            est.source(),
+            Source::Regression,
+            "mu_source must stop claiming broker rates once the broker is gone"
+        );
+    }
+
+    #[test]
+    fn a_stale_broker_estimate_eventually_reverts_to_unknown() {
+        // The broker answers once, then never again, and the queue gives the
+        // regression nothing to work with (n pinned). Reporting the original
+        // number as a live broker measurement forever would both misstate its
+        // provenance and permanently suppress probing, because a live direct
+        // source never asks for one.
+        let mut est = Estimator::new(1.0, 1.0);
+        est.observe(&Observation {
+            backlog: 5_000,
+            running: 10,
+            dt: DT,
+            interference: false,
+            rates: Some(BrokerRates {
+                ack_rate: 80.0,
+                publish_rate: 200.0,
+            }),
+        });
+        assert_eq!(est.source(), Source::Direct);
+        assert!(!est.needs_probe());
+
+        for i in 0..DIRECT_GRACE_WINDOWS {
+            est.observe(&Observation {
+                backlog: 5_000 + i,
+                running: 10,
+                dt: DT,
+                interference: false,
+                rates: None,
+            });
+        }
+        // Still inside the grace window: the number is old but usable.
+        assert_eq!(est.source(), Source::Direct);
+        assert_eq!(est.mu(), Some(8.0));
+
+        for i in 0..10 {
+            est.observe(&Observation {
+                backlog: 6_000 + i,
+                running: 10,
+                dt: DT,
+                interference: false,
+                rates: None,
+            });
+        }
+        assert_eq!(est.source(), Source::None);
+        assert_eq!(est.mu(), None, "a long-stale estimate must not steer");
+        assert!(
+            est.needs_probe(),
+            "with the broker gone and no fit, the controller must be told to probe"
+        );
     }
 
     #[test]

@@ -63,6 +63,11 @@ upgrade** — see the note below for what it was actually doing.
 - `/metrics` answered on any path, so a probe against `/` looked like a working
   scrape target.
 - A slow drain blocked the whole control loop, including every other program.
+- `min_workers` was silently ignored whenever the queue could not be read: the
+  error path skipped the decision entirely, so an unreachable broker left a
+  configured pool empty instead of at its floor.
+- Metrics labels carried the raw per-worker template, so every series was
+  labelled `program="consumer_%(process_num)02d"`.
 
 ### Added
 
@@ -79,7 +84,10 @@ upgrade** — see the note below for what it was actually doing.
 - New metrics: `effiqueue_mu_source` (0 none / 1 broker / 2 regression),
   `effiqueue_probing`, `effiqueue_probe_total`.
 - Concurrent drain on shutdown — one `drain_timeout`, not N.
-- **Release workflow** publishing signed-checksum binaries for Linux
+- A broker-measured estimate now ages out if the management API goes quiet,
+  reverting `mu` to unknown rather than steering on a stale number or reporting
+  it as a live broker measurement.
+- **Release workflow** publishing binaries, with SHA-256 checksums, for Linux
   (gnu/musl × x86_64/aarch64), macOS (Intel/Apple Silicon) and Windows.
 - CI: `--locked` everywhere, MSRV check, `cargo audit`, `cargo publish
   --dry-run`, and an **end-to-end smoke test against a real RabbitMQ in both

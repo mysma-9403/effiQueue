@@ -259,7 +259,7 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
                 cfg.queue_name.clone(),
                 build_management_client(&cfg),
             );
-            let name: Arc<str> = Arc::from(cfg.process_name.as_str());
+            let name: Arc<str> = Arc::from(config::program_label(&cfg.process_name).as_str());
             let ticks = cfg.cooldown_ticks;
             Prog {
                 cfg,
@@ -381,6 +381,23 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
                     // The estimator must not see this gap as a single window, so
                     // its backlog baseline is reset rather than left stale.
                     p.est.forget_backlog();
+                    // min_workers is a floor, not a queue-driven decision. An
+                    // unreachable broker must not leave a configured pool empty —
+                    // the workers reconnect on their own.
+                    let mut running = running;
+                    if running < p.cfg.min_workers {
+                        match p.pool.spawn_one() {
+                            Ok(Some(_)) => {
+                                p.scale_up_total += 1;
+                                p.ticks_since_change = 0;
+                                running = p.pool.len() as u32;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::error!(program = %p.cfg.process_name, error = %e, "failed to start worker for the min_workers floor");
+                            }
+                        }
+                    }
                     p.running_in_window = running;
                     p.expected_running = running;
                     snapshots.push(metrics::ProgramSnapshot {

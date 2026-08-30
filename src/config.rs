@@ -465,6 +465,19 @@ pub fn expand_process_num(template: &str, n: u32) -> String {
     template.replace("%(process_num)02d", &format!("{n:02}"))
 }
 
+/// A stable name for the *program* (not an individual worker), for use as a
+/// metrics label. `process_name` is a per-worker template, so leaving the
+/// placeholder in would put a literal `%(process_num)02d` in every label.
+pub fn program_label(process_name: &str) -> String {
+    let stripped = process_name.replace("%(process_num)02d", "");
+    let trimmed = stripped.trim_matches(|c: char| c == '_' || c == '-' || c == '.' || c == ' ');
+    if trimmed.is_empty() {
+        "program".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,6 +601,17 @@ mod tests {
         assert_eq!(cfg.slo_drain_time, Some(Duration::from_secs(120)));
         assert_eq!(cfg.ram_headroom, Some(2 * 1024 * 1024 * 1024));
         assert_eq!(cfg.ram_budget, None);
+    }
+
+    #[test]
+    fn program_label_strips_the_worker_placeholder() {
+        // A metrics label must name the program, not a worker template.
+        assert_eq!(program_label("consumer_%(process_num)02d"), "consumer");
+        assert_eq!(program_label("index-%(process_num)02d"), "index");
+        assert_eq!(program_label("mailer"), "mailer");
+        // Degenerate templates still yield something usable as a label.
+        assert_eq!(program_label("%(process_num)02d"), "program");
+        assert_eq!(program_label(""), "program");
     }
 
     #[test]

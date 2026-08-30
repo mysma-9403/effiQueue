@@ -165,7 +165,35 @@ Set `metrics_addr` (e.g. `127.0.0.1:9101`) to expose Prometheus metrics at
 `GET /metrics`, including the signature series `effiqueue_workers_needed`,
 `effiqueue_workers_capacity`, `effiqueue_feasibility_gap`, plus
 `effiqueue_mu`, `effiqueue_lambda`, `effiqueue_mu_source`, `effiqueue_workers`,
-`effiqueue_backlog` and scale/probe counters.
+`effiqueue_backlog`, per-worker and pool RSS, the RAM budget, `best_drain`,
+estimator spread, crash-loop back-off and scale/probe counters.
+
+## Live view
+
+```sh
+effiqueue top --url http://127.0.0.1:9101/metrics
+```
+
+```
+┌ feasibility gap ──────────────────────────────────────────────────────────┐
+│SLO 120s unreachable on this host                                          │
+│need 78 workers, this machine safely fits 24 — short by 54 (~27.0GB)       │
+│best achievable drain: never                                               │
+└───────────────────────────────────────────────────────────────────────────┘
+┌ capacity ─────────────────────────────────────────────────────────────────┐
+│██████████████                running   10                                 │
+│██████████████████████████████needed    78 ████████████████████████████████│
+│█████████████████████████████ capacity  24                                 │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+`top` is a **client**, not part of the daemon: it polls the `/metrics` endpoint
+the daemon already exposes and touches nothing in the control loop, so it costs
+a running instance nothing and works against a remote host. `←/→` switches
+program, `p` pauses, `q` quits.
+
+It ships in the released binaries. `cargo build --no-default-features` drops it
+(and the `ratatui` dependency) if you want the daemon and nothing else.
 
 ## Deployment
 

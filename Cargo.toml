@@ -27,6 +27,14 @@ shell-words = "1"
 thiserror = "1"
 anyhow = "1"
 
+# `top` is a viewer, not part of the daemon. On by default so the released
+# binaries actually have it; `--no-default-features` gives a minimal build.
+ratatui = { version = "0.30", optional = true }
+
+[features]
+default = ["tui"]
+tui = ["dep:ratatui"]
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process"] }
 

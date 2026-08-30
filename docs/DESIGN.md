@@ -322,6 +322,13 @@ program. No authentication — bind it to localhost or a private interface.
 | `effiqueue_probing` | 1 while perturbing to identify `mu` |
 | `effiqueue_scale_up_total`, `effiqueue_scale_down_total`, `effiqueue_probe_total` | counters |
 
+`effiqueue top` renders all of this live. It is deliberately a **client** over
+the same endpoint rather than a mode of the daemon: the control loop then has no
+code path for it at all, a daemon with no TTY never has to manage terminal state,
+and a production instance can be watched from elsewhere. The exporter and the
+viewer's parser are covered by a round-trip test, since a series renamed on one
+side would otherwise silently blank a panel.
+
 `effiqueue_mu_source` is the one to watch first. `0` means the controller does not
 know throughput and is running on the bootstrap path; `1` means the management API
 is doing the work; `2` means it is inferring from perturbation.

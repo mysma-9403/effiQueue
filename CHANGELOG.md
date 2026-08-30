@@ -103,6 +103,18 @@ upgrade** — see the note below for what it was actually doing.
 - `swap_ratio_cap` (default `0.2`) makes the swap brake tunable. It was a
   hardcoded 20% with no escape hatch, which is unworkable on macOS, where the
   swapfile is sized on demand and the used/total ratio is high by construction.
+- **`effiqueue top`** — a live terminal view of a running instance. It is a
+  client: it polls the `/metrics` endpoint the daemon already exposes, so the
+  control loop has no code path for it and pays nothing when it is not running,
+  and it works against a remote host. A daemon under systemd or Docker has no
+  TTY, which is the other reason this is not embedded in it. Shown by default in
+  the release binaries; `--no-default-features` drops it and its `ratatui`
+  dependency.
+- Metrics for what the view needs, useful in Grafana independently:
+  `effiqueue_worker_rss_bytes`, `effiqueue_pool_rss_bytes`,
+  `effiqueue_ram_budget_bytes`, `effiqueue_best_drain_seconds`,
+  `effiqueue_slo_drain_seconds`, `effiqueue_estimator_spread`,
+  `effiqueue_spawn_backoff_seconds`.
 - New metrics: `effiqueue_mu_source` (0 none / 1 broker / 2 regression),
   `effiqueue_probing`, `effiqueue_probe_total`.
 - Concurrent drain on shutdown — one `drain_timeout`, not N.

@@ -17,22 +17,17 @@
 //! a private network. Point `management_url` at a local reverse proxy if the
 //! management API is only reachable over TLS.
 
+use crate::http;
 use serde::Deserialize;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 const DEFAULT_MANAGEMENT_PORT: u16 = 15672;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-/// Guard against a hostile or broken endpoint streaming forever.
-const MAX_RESPONSE: usize = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManagementError {
-    #[error("management API is not reachable: {0}")]
-    Transport(String),
-    #[error("management API returned HTTP {0}")]
-    Status(u16),
+    #[error("management API request failed: {0}")]
+    Http(#[from] http::HttpError),
     #[error("could not parse the management API response: {0}")]
     Body(String),
     #[error("cannot derive a management URL from '{0}': {1}")]
@@ -168,101 +163,14 @@ impl ManagementClient {
     }
 
     async fn get(&self, path: &str) -> Result<String, ManagementError> {
-        let fut = async {
-            let mut stream = TcpStream::connect((self.host.as_str(), self.port))
-                .await
-                .map_err(|e| ManagementError::Transport(e.to_string()))?;
-            let request = format!(
-                "GET {path} HTTP/1.1\r\nHost: {}:{}\r\nAuthorization: Basic {}\r\n\
-                 Accept: application/json\r\nUser-Agent: effiqueue\r\nConnection: close\r\n\r\n",
-                self.host, self.port, self.authorization
-            );
-            stream
-                .write_all(request.as_bytes())
-                .await
-                .map_err(|e| ManagementError::Transport(e.to_string()))?;
-
-            let mut raw = Vec::new();
-            let mut chunk = [0u8; 8192];
-            loop {
-                let n = stream
-                    .read(&mut chunk)
-                    .await
-                    .map_err(|e| ManagementError::Transport(e.to_string()))?;
-                if n == 0 {
-                    break;
-                }
-                raw.extend_from_slice(&chunk[..n]);
-                if raw.len() > MAX_RESPONSE {
-                    return Err(ManagementError::Body("response too large".into()));
-                }
-            }
-            parse_http_response(&raw)
-        };
-
-        match tokio::time::timeout(REQUEST_TIMEOUT, fut).await {
-            Ok(result) => result,
-            Err(_) => Err(ManagementError::Transport("request timed out".into())),
-        }
-    }
-}
-
-/// Split a response into status + body, de-chunking when necessary.
-fn parse_http_response(raw: &[u8]) -> Result<String, ManagementError> {
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| ManagementError::Body("no header terminator".into()))?;
-    let head = String::from_utf8_lossy(&raw[..split]);
-    let body = &raw[split + 4..];
-
-    let mut lines = head.lines();
-    let status_line = lines
-        .next()
-        .ok_or_else(|| ManagementError::Body("empty response".into()))?;
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse().ok())
-        .ok_or_else(|| ManagementError::Body(format!("bad status line '{status_line}'")))?;
-    if !(200..300).contains(&status) {
-        return Err(ManagementError::Status(status));
-    }
-
-    let chunked = lines.any(|l| {
-        let l = l.to_ascii_lowercase();
-        l.starts_with("transfer-encoding:") && l.contains("chunked")
-    });
-    let body = if chunked {
-        dechunk(body)?
-    } else {
-        body.to_vec()
-    };
-    String::from_utf8(body).map_err(|e| ManagementError::Body(e.to_string()))
-}
-
-fn dechunk(mut body: &[u8]) -> Result<Vec<u8>, ManagementError> {
-    let mut out = Vec::with_capacity(body.len());
-    loop {
-        let eol = body
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .ok_or_else(|| ManagementError::Body("truncated chunk header".into()))?;
-        let header = String::from_utf8_lossy(&body[..eol]);
-        // A chunk header may carry extensions after a ';'.
-        let size_hex = header.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_hex, 16)
-            .map_err(|_| ManagementError::Body(format!("bad chunk size '{size_hex}'")))?;
-        body = &body[eol + 2..];
-        if size == 0 {
-            return Ok(out);
-        }
-        if body.len() < size {
-            return Err(ManagementError::Body("truncated chunk body".into()));
-        }
-        out.extend_from_slice(&body[..size]);
-        // Skip the chunk's trailing CRLF.
-        body = body.get(size + 2..).unwrap_or(&[]);
+        Ok(http::get(
+            &self.host,
+            self.port,
+            path,
+            Some(&format!("Basic {}", self.authorization)),
+            REQUEST_TIMEOUT,
+        )
+        .await?)
     }
 }
 
@@ -370,51 +278,12 @@ fn percent_encode(s: &str) -> String {
 }
 
 fn basic_auth(user: &str, password: &str) -> String {
-    base64(format!("{user}:{password}").as_bytes())
-}
-
-/// Standard base64 with padding. Small enough not to warrant a dependency.
-fn base64(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(TABLE[(n >> 18) as usize & 63] as char);
-        out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
+    http::base64(format!("{user}:{password}").as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn base64_matches_rfc4648_vectors() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"foob"), "Zm9vYg==");
-        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
-        assert_eq!(base64(b"guest:guest"), "Z3Vlc3Q6Z3Vlc3Q=");
-    }
 
     #[test]
     fn derives_management_endpoint_from_amqp_uri() {
@@ -488,7 +357,7 @@ mod tests {
         .unwrap();
         assert_eq!(c.endpoint(), "http://mgmt.internal:8080");
         assert_eq!(c.vhost, "prod"); // vhost still comes from the AMQP URI
-        assert_eq!(c.authorization, base64(b"admin:s3cret"));
+        assert_eq!(c.authorization, http::base64(b"admin:s3cret"));
     }
 
     #[test]
@@ -498,38 +367,12 @@ mod tests {
             "amqp://bob:pw@broker:5672/prod",
         )
         .unwrap();
-        assert_eq!(c.authorization, base64(b"bob:pw"));
+        assert_eq!(c.authorization, http::base64(b"bob:pw"));
     }
 
     #[test]
     fn override_rejects_non_http_urls() {
         assert!(ManagementClient::from_override("https://x:15672", "amqp://h").is_err());
-    }
-
-    #[test]
-    fn parses_a_content_length_response() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 9\r\n\r\n{\"a\": 1}\n";
-        assert_eq!(parse_http_response(raw).unwrap(), "{\"a\": 1}\n");
-    }
-
-    #[test]
-    fn parses_a_chunked_response() {
-        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n{\"a\":\r\n3\r\n 1}\r\n0\r\n\r\n";
-        assert_eq!(parse_http_response(raw).unwrap(), "{\"a\": 1}");
-    }
-
-    #[test]
-    fn surfaces_http_errors() {
-        let raw = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-        assert!(matches!(
-            parse_http_response(raw),
-            Err(ManagementError::Status(404))
-        ));
-        let raw = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
-        assert!(matches!(
-            parse_http_response(raw),
-            Err(ManagementError::Status(401))
-        ));
     }
 
     #[test]

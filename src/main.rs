@@ -1,11 +1,14 @@
 mod config;
 mod estimator;
+mod http;
 mod management;
 mod metrics;
 mod platform;
 mod policy;
 mod rabbitmq_connector;
 mod system_info;
+#[cfg(feature = "tui")]
+mod tui;
 mod worker;
 
 use clap::{Parser, Subcommand};
@@ -31,6 +34,20 @@ enum Cmd {
     Run,
     /// Validate the config and exit.
     ValidateConfig,
+    /// Live terminal view of a running instance, read from its /metrics endpoint.
+    ///
+    /// This is a client: it polls an endpoint the daemon already exposes and
+    /// touches nothing in the control loop, so it costs the daemon nothing and
+    /// works against a remote host.
+    #[cfg(feature = "tui")]
+    Top {
+        /// Metrics endpoint to watch.
+        #[arg(long, default_value = "http://127.0.0.1:9101/metrics")]
+        url: String,
+        /// Seconds between scrapes.
+        #[arg(long, default_value = "2")]
+        interval: u64,
+    },
 }
 
 /// How often the feasibility gap is re-logged at WARN while it persists.
@@ -72,6 +89,8 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Run => run(cfgs).await,
+        #[cfg(feature = "tui")]
+        Cmd::Top { url, interval } => tui::run(&url, Duration::from_secs(interval.max(1))).await,
     }
 }
 
@@ -432,6 +451,10 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
                 let running = p.pool.len() as u32;
                 let interference = running != p.expected_running;
                 let (this_rss, worker_rss) = prog_rss[idx];
+                // Filled in by the slo branch; the defaults describe "not known
+                // this tick", which is also the honest answer on the error path.
+                let mut best_drain_seconds = -1.0_f64;
+                let mut ram_budget_bytes = 0_u64;
 
                 let reading = match p.source.read().await {
                     Ok(r) => r,
@@ -473,6 +496,21 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
                             scale_up_total: p.scale_up_total,
                             scale_down_total: p.scale_down_total,
                             probe_total: p.probe_total,
+                            worker_rss_bytes: worker_rss.unwrap_or(0),
+                            pool_rss_bytes: this_rss,
+                            ram_budget_bytes,
+                            best_drain_seconds,
+                            estimator_spread: p.est.spread(),
+                            spawn_backoff_seconds: p
+                                .pool
+                                .spawn_backoff_remaining()
+                                .map(|d| d.as_secs_f64())
+                                .unwrap_or(0.0),
+                            slo_drain_seconds: p
+                                .cfg
+                                .slo_drain_time
+                                .map(|d| d.as_secs_f64())
+                                .unwrap_or(0.0),
                         });
                         continue;
                     }
@@ -562,6 +600,12 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
                             .as_ref()
                             .map(|g| g.gap_workers as u64)
                             .unwrap_or(0);
+                        best_drain_seconds = d
+                            .feasibility_gap
+                            .as_ref()
+                            .map(|g| g.best_drain.map(|d| d.as_secs_f64()).unwrap_or(-1.0))
+                            .unwrap_or(-1.0);
+                        ram_budget_bytes = eff_budget;
                         (d.action, d.probing, needed, d.workers_capacity as u64, gap)
                     }
                     config::Mode::Threshold => {
@@ -650,6 +694,17 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
                     scale_up_total: p.scale_up_total,
                     scale_down_total: p.scale_down_total,
                     probe_total: p.probe_total,
+                    worker_rss_bytes: worker_rss.unwrap_or(0),
+                    pool_rss_bytes: this_rss,
+                    ram_budget_bytes,
+                    best_drain_seconds,
+                    estimator_spread: p.est.spread(),
+                    spawn_backoff_seconds: p
+                        .pool
+                        .spawn_backoff_remaining()
+                        .map(|d| d.as_secs_f64())
+                        .unwrap_or(0.0),
+                    slo_drain_seconds: p.cfg.slo_drain_time.map(|d| d.as_secs_f64()).unwrap_or(0.0),
                 });
             }
 

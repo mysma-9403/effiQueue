@@ -25,6 +25,20 @@ pub struct ProgramSnapshot {
     pub mu_source: u64,
     /// 1 while this tick's action was an identifiability probe.
     pub probing: u64,
+    /// Per-worker RSS used to size capacity (the largest live worker), bytes.
+    pub worker_rss_bytes: u64,
+    /// RSS of this program's whole pool, bytes.
+    pub pool_rss_bytes: u64,
+    /// RAM this program may still claim, bytes.
+    pub ram_budget_bytes: u64,
+    /// Drain time achievable at full capacity; `-1` = never, or not applicable.
+    pub best_drain_seconds: f64,
+    /// `sum (n_i - n_mean)^2` — the regression's identifiability budget.
+    pub estimator_spread: f64,
+    /// Seconds until the crash-loop back-off releases; 0 when not backing off.
+    pub spawn_backoff_seconds: f64,
+    /// The configured drain-time SLO, seconds; 0 in threshold mode.
+    pub slo_drain_seconds: f64,
     pub scale_up_total: u64,
     pub scale_down_total: u64,
     pub probe_total: u64,
@@ -47,7 +61,7 @@ impl Metrics {
         self.programs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         let progs = self.lock();
         let mut s = String::new();
         block(
@@ -121,6 +135,62 @@ impl Metrics {
             "gauge",
             "1 while the controller is perturbing worker count to identify mu.",
             |p| p.probing.to_string(),
+        );
+        block(
+            &mut s,
+            &progs,
+            "effiqueue_worker_rss_bytes",
+            "gauge",
+            "RSS of the largest live worker — what sizes capacity.",
+            |p| p.worker_rss_bytes.to_string(),
+        );
+        block(
+            &mut s,
+            &progs,
+            "effiqueue_pool_rss_bytes",
+            "gauge",
+            "RSS of this program's whole worker pool.",
+            |p| p.pool_rss_bytes.to_string(),
+        );
+        block(
+            &mut s,
+            &progs,
+            "effiqueue_ram_budget_bytes",
+            "gauge",
+            "RAM this program may still claim.",
+            |p| p.ram_budget_bytes.to_string(),
+        );
+        block(
+            &mut s,
+            &progs,
+            "effiqueue_best_drain_seconds",
+            "gauge",
+            "Drain achievable at full capacity (-1 = never or not applicable).",
+            |p| format!("{}", p.best_drain_seconds),
+        );
+        block(
+            &mut s,
+            &progs,
+            "effiqueue_slo_drain_seconds",
+            "gauge",
+            "Configured drain-time SLO (0 = threshold mode).",
+            |p| format!("{}", p.slo_drain_seconds),
+        );
+        block(
+            &mut s,
+            &progs,
+            "effiqueue_estimator_spread",
+            "gauge",
+            "Worker-count spread available to the regression estimator.",
+            |p| format!("{}", p.estimator_spread),
+        );
+        block(
+            &mut s,
+            &progs,
+            "effiqueue_spawn_backoff_seconds",
+            "gauge",
+            "Seconds until the crash-loop back-off releases (0 = not backing off).",
+            |p| format!("{}", p.spawn_backoff_seconds),
         );
         block(
             &mut s,
@@ -237,6 +307,13 @@ mod tests {
             lambda: 200.0,
             mu_source: 1,
             probing: 0,
+            worker_rss_bytes: 128 * 1024 * 1024,
+            pool_rss_bytes: 512 * 1024 * 1024,
+            ram_budget_bytes: 8 * 1024 * 1024 * 1024,
+            best_drain_seconds: 42.0,
+            estimator_spread: 12.5,
+            spawn_backoff_seconds: 0.0,
+            slo_drain_seconds: 120.0,
             scale_up_total: 12,
             scale_down_total: 3,
             probe_total: 2,
@@ -258,6 +335,13 @@ mod tests {
             "effiqueue_lambda",
             "effiqueue_mu_source",
             "effiqueue_probing",
+            "effiqueue_worker_rss_bytes",
+            "effiqueue_pool_rss_bytes",
+            "effiqueue_ram_budget_bytes",
+            "effiqueue_best_drain_seconds",
+            "effiqueue_slo_drain_seconds",
+            "effiqueue_estimator_spread",
+            "effiqueue_spawn_backoff_seconds",
             "effiqueue_scale_up_total",
             "effiqueue_scale_down_total",
             "effiqueue_probe_total",

@@ -153,8 +153,10 @@ In multi-program configs, `poll_interval`, `drain_timeout`, `ram_budget` /
 shared RAM budget, one metrics endpoint. Everything else can be set per
 `[[program]]`.
 
-Legacy Supervisor keys (`process_name`, `autostart`, `autorestart`, `queue`) are
-accepted; the old `max` is mapped to `max_workers` with a deprecation warning.
+Legacy Supervisor keys (`process_name`, `autostart`, `autorestart`) are accepted;
+the old `max` is mapped to `max_workers` with a deprecation warning. `queue` is
+accepted but must name a backend that exists — `rabbitmq` is the only one today,
+and anything else is now a startup error rather than being silently ignored.
 
 ## Metrics
 

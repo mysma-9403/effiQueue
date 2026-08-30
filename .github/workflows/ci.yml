@@ -29,6 +29,11 @@ jobs:
         run: cargo test --all --locked
       - name: build (release)
         run: cargo build --release --locked
+      # The daemon must still build without the viewer and its dependency.
+      - name: build (no default features)
+        run: cargo build --locked --no-default-features
+      - name: test (no default features)
+        run: cargo test --all --locked --no-default-features
 
   # The MSRV claimed in Cargo.toml has to actually build.
   msrv:

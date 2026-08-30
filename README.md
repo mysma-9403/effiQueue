@@ -140,6 +140,7 @@ Two formats are accepted: **TOML** and the legacy Supervisor-style `.conf`
 | `management` | `true` | use the RabbitMQ management API for backlog + rates |
 | `management_url` | (derived) | explicit `http://[user:pass@]host:port` endpoint |
 | `metrics_addr` | — | optional Prometheus `/metrics` listen address |
+| `swap_ratio_cap` | `0.2` | swap-used fraction above which growth is blocked; `1.0` disables |
 | `depth_threshold` | `40` | (threshold mode) scale-up above this backlog |
 | `alpha_mu`, `alpha_lambda` | `0.3` | EWMA smoothing for µ / λ, in (0, 1] |
 | `hysteresis`, `cooldown_ticks`, `spike_backlog` | `1`, `2`, `1000` | controller damping / fast-path |
@@ -198,6 +199,10 @@ and falls back to a hard kill after `drain_timeout`. Unix/macOS get a real
 - Worker RSS is **summed**, which double-counts memory shared between workers
   (significant for e.g. a fleet of PHP workers) and therefore overstates the
   derived budget.
+- The **swap brake** blocks growth once `used_swap / total_swap` exceeds
+  `swap_ratio_cap`. macOS grows its swapfile on demand, so that ratio runs high
+  by construction and the default 0.2 will pin the pool at one worker there;
+  raise `swap_ratio_cap` (or set it to `1.0`) on such hosts.
 - Without the management API, AMQP reports messages **ready** only — in-flight
   messages are invisible, so the backlog reads low while workers are still busy.
 - The worker registry is **in memory only**: after a hard kill of effiQueue

@@ -125,7 +125,9 @@ returns `None` and the controller treats throughput as unknown.
 That creates an obligation. If the pool sat pinned at `max_workers`, `n` would
 never move and `mu` would never become observable. So the estimator exposes
 `needs_probe()`, and the controller answers it: with a backlog present and no
-room to grow, it steps **one** worker down purely to buy the spread. This is a
+room to grow, it steps **one** worker down purely to buy the spread — never
+below one worker, since halting all progress to learn something is a bad trade,
+and at a ceiling of one there is nothing to learn anyway. This is a
 deliberate, bounded, logged perturbation, surfaced as `effiqueue_probe_total`.
 
 Practical note: with `n` varying by only ±1, `Sxx` is small and the estimator's
@@ -148,8 +150,14 @@ workers_capacity = floor(safe_ram_budget / worker_rss)
 * `worker_rss` is the **largest** live worker, not the mean. A worker spawned
   seconds ago has barely faulted its pages in; averaging it in would overstate how
   many more fit, precisely when scaling up.
-* Under swap pressure (`used_swap * 5 > total_swap`), capacity is clamped to the
-  current count: no growth while the machine is already paging.
+* Under swap pressure (`used_swap / total_swap > swap_ratio_cap`, default 0.2)
+  capacity is clamped to the current count: no growth while the machine is
+  already paging. It is never clamped below **one** worker, though — with an
+  empty pool our contribution to the pressure is zero, so refusing to start the
+  first worker cannot relieve it and would simply leave the queue undrained
+  forever, since the bootstrap path needs `running < capacity` to move.
+  The threshold is configurable because some hosts (macOS especially, which
+  sizes its swapfile on demand) sit above any fixed ratio by construction.
 * Capacity is finally clamped by `max_workers`.
 
 With several programs the budget is **shared**: each may claim only what the
@@ -292,6 +300,7 @@ one metrics endpoint.
 | `spike_backlog` | `1000` | above this, scale-up skips the cooldown |
 | `drain_timeout` | `30s` | typical upper bound on one message |
 | `ram_headroom` | `2GB` | left for the OS and page cache |
+| `swap_ratio_cap` | `0.2` | growth brake once the host is paging; `1.0` disables |
 | `management` | `true` | derive the management endpoint and prefer it |
 
 ---

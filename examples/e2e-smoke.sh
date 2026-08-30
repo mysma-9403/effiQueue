@@ -11,14 +11,23 @@
 #
 # Requires curl. Starts RabbitMQ in Docker unless EQ_EXTERNAL_RABBIT=1 (CI
 # provides it as a service container).
+#
+# Ports are overridable, because assuming ownership of 5672 collides with any
+# broker a developer already has running — and pointing the test at *that* broker
+# would have it create and purge queues in a live environment:
+#
+#   EQ_AMQP_PORT=5673 EQ_MGMT_PORT=15673 EQ_METRICS_PORT=9111 ./examples/e2e-smoke.sh
 set -euo pipefail
 
 MODE="${MODE:-threshold}"
 IMG=rabbitmq:3-management
 CT=eq-e2e-rabbit
-API="${EQ_API:-http://localhost:15672/api}"
+AMQP_PORT="${EQ_AMQP_PORT:-5672}"
+MGMT_PORT="${EQ_MGMT_PORT:-15672}"
+METRICS_PORT="${EQ_METRICS_PORT:-9110}"
+API="${EQ_API:-http://localhost:$MGMT_PORT/api}"
 Q=messages_e2e
-METRICS="http://127.0.0.1:9110/metrics"
+METRICS="http://127.0.0.1:$METRICS_PORT/metrics"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CFG="$HERE/config.e2e.$MODE.toml"
 BIN="${EQ_BIN:-./target/debug/effiqueue}"
@@ -26,9 +35,21 @@ EXTERNAL="${EQ_EXTERNAL_RABBIT:-0}"
 
 [ -f "$CFG" ] || { echo "no config for MODE=$MODE ($CFG)"; exit 2; }
 
+# The shipped configs stay readable as documentation (default ports, no clutter);
+# the ports actually used are substituted into a throwaway copy.
+RENDERED="$(mktemp -t effiqueue-e2e-XXXXXX).toml"
+sed -e "s|localhost:5672|localhost:$AMQP_PORT|g" \
+    -e "s|127.0.0.1:9110|127.0.0.1:$METRICS_PORT|g" "$CFG" > "$RENDERED"
+# A non-default management port cannot be derived from the AMQP URI, which only
+# ever implies 15672.
+if [ "$MGMT_PORT" != 15672 ]; then
+  echo "management_url = \"http://guest:guest@localhost:$MGMT_PORT\"" >> "$RENDERED"
+fi
+
 EQ_PID=""
 cleanup() {
   [ -n "$EQ_PID" ] && kill "$EQ_PID" 2>/dev/null || true
+  rm -f "$RENDERED"
   [ "$EXTERNAL" = 1 ] || docker rm -f "$CT" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -39,9 +60,10 @@ trap cleanup EXIT
 metric() { curl -s "$METRICS" | awk -v p="$1{" 'index($0, p) == 1 { print $2; exit }'; }
 
 if [ "$EXTERNAL" != 1 ]; then
-  echo "==> starting RabbitMQ ($IMG)"
+  echo "==> starting RabbitMQ ($IMG) on $AMQP_PORT/$MGMT_PORT"
   docker rm -f "$CT" >/dev/null 2>&1 || true
-  docker run -d --rm --name "$CT" -p 5672:5672 -p 15672:15672 "$IMG" >/dev/null
+  docker run -d --rm --name "$CT" \
+    -p "$AMQP_PORT:5672" -p "$MGMT_PORT:15672" "$IMG" >/dev/null
 fi
 
 echo "==> waiting for the management API"
@@ -68,7 +90,7 @@ cargo build -q
 
 echo "==> starting effiQueue (mode=$MODE)"
 chmod +x "$HERE/e2e-consumer.sh"
-RUST_LOG="${RUST_LOG:-info}" "$BIN" --config "$CFG" &
+EQ_API="$API" EQ_QUEUE="$Q" RUST_LOG="${RUST_LOG:-info}" "$BIN" --config "$RENDERED" &
 EQ_PID=$!
 
 echo "==> expecting scale-up"

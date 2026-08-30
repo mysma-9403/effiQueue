@@ -397,8 +397,16 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
             let total_worker_rss: u64 = prog_rss.iter().map(|(sum, _)| sum).sum();
             let safe_ram_budget =
                 ram_pool_budget(ram_budget, ram_headroom, &host, total_worker_rss);
+            // The reading is host-wide but the knob is per-program, so the
+            // strictest configured cap governs. macOS grows its swapfile on
+            // demand, which keeps used/total high by construction — hence the
+            // escape hatch rather than a hardcoded threshold.
+            let swap_cap = progs
+                .iter()
+                .map(|p| p.cfg.swap_ratio_cap)
+                .fold(f64::INFINITY, f64::min);
             let swap_pressure =
-                host.total_swap > 0 && host.used_swap.saturating_mul(5) > host.total_swap;
+                host.total_swap > 0 && (host.used_swap as f64 / host.total_swap as f64) > swap_cap;
             let ram_ratio = if host.memory_total > 0 {
                 host.memory_used as f64 / host.memory_total as f64
             } else {

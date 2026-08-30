@@ -82,7 +82,14 @@ pub fn decide_slo(p: &SloParams, i: &SloInputs) -> Decision {
         _ => p.max_workers, // no RSS measurement yet -> not RAM-constrained
     };
     if i.swap_pressure {
-        capacity = capacity.min(i.running); // block scale-up while swapping
+        // Block growth while the host is paging — but never below a single
+        // worker. Pinning capacity to the running count reads as "don't make it
+        // worse", except when the pool is *empty*: our contribution to the
+        // pressure is then exactly zero, so refusing to start the first worker
+        // cannot relieve it. It only guarantees the queue is never drained,
+        // permanently, because the bootstrap path needs `running < capacity` to
+        // move. Any host with swap in use would have an inert SLO controller.
+        capacity = capacity.min(i.running.max(1));
     }
     capacity = capacity.min(p.max_workers);
 
@@ -160,7 +167,12 @@ fn decide_action(
         // never move again and mu would stay unobservable forever. Step one
         // worker down to buy the spread the regression needs. This is the
         // scale-by-one perturbation the design is built on.
-        if i.needs_probe && i.running > p.min_workers {
+        //
+        // Never below one worker while there is a backlog, though. Probing down
+        // to an empty pool halts all progress to learn something, and with a
+        // ceiling of one there is nothing to learn anyway — the controller is
+        // pinned whatever mu turns out to be.
+        if i.needs_probe && i.running > p.min_workers.max(1) {
             return (ScalingAction::ScaleDown, true);
         }
         return (ScalingAction::Hold, false);
@@ -329,6 +341,49 @@ mod tests {
     }
 
     #[test]
+    fn swap_pressure_still_allows_the_very_first_worker() {
+        // Regression: the clamp used to pin capacity to `running`, which is 0
+        // for an empty pool, and the bootstrap path needs `running < capacity`.
+        // On any host with swap in use — most laptops, plenty of servers — slo
+        // mode could never start a single worker and the queue never drained.
+        let p = slo_params();
+        let i = SloInputs {
+            backlog: 5_000,
+            running: 0,
+            mu: None,
+            lambda: 0.0,
+            worker_rss: None,
+            safe_ram_budget: 8 * 1024 * 1024 * 1024,
+            swap_pressure: true,
+            ticks_since_change: 10,
+            needs_probe: false,
+        };
+        let d = decide_slo(&p, &i);
+        assert_eq!(d.workers_capacity, 1, "one worker must remain reachable");
+        assert_eq!(d.action, ScalingAction::ScaleUp);
+    }
+
+    #[test]
+    fn swap_pressure_still_blocks_growth_beyond_the_first() {
+        // The brake must still work once the pool is actually running.
+        let p = slo_params();
+        let i = SloInputs {
+            backlog: 50_000,
+            running: 3,
+            mu: Some(8.0),
+            lambda: 10.0,
+            worker_rss: Some(100 * 1024 * 1024),
+            safe_ram_budget: 64 * 1024 * 1024 * 1024,
+            swap_pressure: true,
+            ticks_since_change: 10,
+            needs_probe: false,
+        };
+        let d = decide_slo(&p, &i);
+        assert_eq!(d.workers_capacity, 3, "capacity stays pinned to running");
+        assert_eq!(d.action, ScalingAction::Hold);
+    }
+
+    #[test]
     fn cooldown_blocks_but_spike_bypasses() {
         let mut p = slo_params();
         p.cooldown_ticks = 3;
@@ -439,6 +494,19 @@ mod tests {
         p.min_workers = 2;
         let d = decide_slo(&p, &probe_inputs(2, true));
         assert_eq!(d.action, ScalingAction::Hold);
+    }
+
+    #[test]
+    fn probe_never_stops_all_work() {
+        // Probing down to an empty pool would halt progress to learn something,
+        // and with a ceiling of one there is nothing to learn: the controller is
+        // pinned whatever mu turns out to be.
+        let mut p = slo_params();
+        p.max_workers = 1;
+        p.min_workers = 0;
+        let d = decide_slo(&p, &probe_inputs(1, true));
+        assert_eq!(d.action, ScalingAction::Hold);
+        assert!(!d.probing);
     }
 
     #[test]

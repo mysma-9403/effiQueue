@@ -57,6 +57,9 @@ pub struct Config {
     pub hysteresis: u32,
     pub cooldown_ticks: u32,
     pub spike_backlog: u32,
+    /// Swap-used fraction above which growth is blocked. `1.0` effectively
+    /// disables the brake, since usage can never exceed the total.
+    pub swap_ratio_cap: f64,
     // threshold-mode knobs.
     pub depth_threshold: u32,
     pub ram_ratio_cap: f64,
@@ -98,6 +101,7 @@ struct RawConfig {
     spike_backlog: Option<u32>,
     depth_threshold: Option<u32>,
     ram_ratio_cap: Option<f64>,
+    swap_ratio_cap: Option<f64>,
     metrics_addr: Option<String>,
     management: Option<bool>,
     management_url: Option<String>,
@@ -223,6 +227,7 @@ fn parse_supervisor_conf(text: &str) -> Result<RawConfig, ConfigError> {
             "spike_backlog" => raw.spike_backlog = Some(parse_u32(&value, "spike_backlog")?),
             "depth_threshold" => raw.depth_threshold = Some(parse_u32(&value, "depth_threshold")?),
             "ram_ratio_cap" => raw.ram_ratio_cap = Some(parse_f64(&value, "ram_ratio_cap")?),
+            "swap_ratio_cap" => raw.swap_ratio_cap = Some(parse_f64(&value, "swap_ratio_cap")?),
             "metrics_addr" => raw.metrics_addr = Some(value),
             "management" => raw.management = Some(parse_bool(&value, "management")?),
             "management_url" => raw.management_url = Some(value),
@@ -327,6 +332,14 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         slo_drain_time
     };
 
+    let swap_ratio_cap = raw.swap_ratio_cap.unwrap_or(0.2);
+    if !(swap_ratio_cap > 0.0 && swap_ratio_cap <= 1.0) {
+        return Err(ConfigError::Invalid {
+            key: "swap_ratio_cap".into(),
+            reason: "must be in the range (0, 1]".into(),
+        });
+    }
+
     let alpha_mu = raw.alpha_mu.unwrap_or(0.3);
     let alpha_lambda = raw.alpha_lambda.unwrap_or(0.3);
     for (name, a) in [("alpha_mu", alpha_mu), ("alpha_lambda", alpha_lambda)] {
@@ -364,6 +377,7 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         spike_backlog: raw.spike_backlog.unwrap_or(1000),
         depth_threshold: raw.depth_threshold.unwrap_or(40),
         ram_ratio_cap: raw.ram_ratio_cap.unwrap_or(0.9),
+        swap_ratio_cap,
         metrics_addr: raw.metrics_addr,
         management: raw.management.unwrap_or(true),
         management_url: raw.management_url,

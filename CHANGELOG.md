@@ -75,6 +75,13 @@ upgrade** — see the note below for what it was actually doing.
 - `/metrics` answered on any path, so a probe against `/` looked like a working
   scrape target.
 - A slow drain blocked the whole control loop, including every other program.
+- **`slo` mode could never start its first worker on any host using swap.** The
+  swap-pressure brake clamped `workers_capacity` to the running count, which is
+  zero for an empty pool, and the bootstrap path needs `running < capacity` to
+  move. The controller sat inert with a full queue. Found by running the new
+  end-to-end test on a developer laptop, where it reproduced immediately.
+- The identifiability probe could step down to **zero** workers, halting all
+  progress in order to measure throughput.
 - `min_workers` was silently ignored whenever the queue could not be read: the
   error path skipped the decision entirely, so an unreachable broker left a
   configured pool empty instead of at its floor.
@@ -93,6 +100,9 @@ upgrade** — see the note below for what it was actually doing.
 - **Identifiability probing.** When pinned at the ceiling with `mu` still
   unknown, the controller steps one worker down on purpose to create the spread
   the regression needs, rather than freezing where `mu` can never be observed.
+- `swap_ratio_cap` (default `0.2`) makes the swap brake tunable. It was a
+  hardcoded 20% with no escape hatch, which is unworkable on macOS, where the
+  swapfile is sized on demand and the used/total ratio is high by construction.
 - New metrics: `effiqueue_mu_source` (0 none / 1 broker / 2 regression),
   `effiqueue_probing`, `effiqueue_probe_total`.
 - Concurrent drain on shutdown — one `drain_timeout`, not N.

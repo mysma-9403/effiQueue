@@ -14,6 +14,11 @@ slo_drain_time = "60s"
 ram_budget = "1GB"
 min_workers = 0
 max_workers = 4
+# CI runners and dev laptops routinely sit above the default 20% swap-used
+# brake (macOS in particular grows its swapfile on demand, so the ratio is high
+# by construction). Disable it here so the test measures the controller, not
+# the host's memory mood.
+swap_ratio_cap = 1.0
 poll_interval = "2s"
 drain_timeout = "5s"
 cooldown_ticks = 1

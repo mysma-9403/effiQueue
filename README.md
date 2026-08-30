@@ -221,6 +221,17 @@ and falls back to a hard kill after `drain_timeout`. Unix/macOS get a real
 - The **regression fallback** (used only when the management API is unreachable)
   needs on the order of 60–180 windows to converge, and degrades under very
   bursty arrivals. Prefer the management API; watch `effiqueue_mu_source`.
+- **`mu` converges slowly and is biased high at first.** Measured against a
+  consumer running at ~3.4 msgs/s/worker, the regression's first estimate was
+  ~10.8 and settled near 3.0 after roughly three minutes of sustained load.
+  Treat an early reading as an upper bound, and prefer the management API, which
+  needs no convergence at all. `effiqueue_estimator_spread` shows how much
+  identifying information the fit has accumulated.
+- **`poll_interval` must not be shorter than the broker's statistics refresh
+  interval** (RabbitMQ's `collect_statistics_interval`, 5s by default). Sampling
+  faster yields a backlog series of flat stretches broken by cliffs, and the fit
+  reads the cliffs as throughput — measured at 7x the true rate on a 2s interval.
+  effiQueue warns at startup if you configure this.
 - **Slew rate is one worker per tick**, so reaching a large capacity takes
   `max_workers × poll_interval`. The spike fast-path skips the cooldown but does
   not enlarge the step.

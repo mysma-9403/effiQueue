@@ -96,7 +96,19 @@ pub fn decide_slo(p: &SloParams, i: &SloInputs) -> Decision {
     // workers_needed via Little's Law; None while mu is not yet reliable.
     let workers_needed = match i.mu {
         Some(mu) if mu > 0.0 && h > 0.0 => {
-            let n = ((i.backlog as f64 + i.lambda * h) / (mu * h)).ceil();
+            // Expected work over the horizon: what is queued now plus what will
+            // arrive while draining it.
+            let work = i.backlog as f64 + i.lambda * h;
+            // Below one whole message there is nothing to staff for. Without
+            // this, `ceil` of any positive value is 1, and since lambda is an
+            // EWMA it only decays towards zero and never reaches it — so an
+            // idle queue would hold a worker forever and scale-to-zero would
+            // never actually happen.
+            let n = if work < 1.0 {
+                0.0
+            } else {
+                (work / (mu * h)).ceil()
+            };
             Some(n.clamp(0.0, u32::MAX as f64) as u32)
         }
         _ => None,
@@ -156,6 +168,17 @@ fn decide_action(
     let Some(needed) = needed else {
         // Bootstrap: no reliable mu yet.
         if i.backlog == 0 {
+            // An empty queue needs no staffing, and that conclusion does not
+            // depend on knowing mu. Holding here would strand idle workers for
+            // as long as the estimator stayed unconverged — which is precisely
+            // when a freshly started instance drains its first backlog — and
+            // would hold the RAM this controller exists to manage.
+            //
+            // Cooldown-gated, because an AMQP-only depth of zero can mean "all
+            // messages are in flight, unacked" rather than "no work".
+            if i.running > p.min_workers && i.ticks_since_change >= p.cooldown_ticks {
+                return (ScalingAction::ScaleDown, false);
+            }
             return (ScalingAction::Hold, false);
         }
         // Growing the pool both drains the backlog and varies `n`, which is what
@@ -301,6 +324,92 @@ mod tests {
         let d = decide_slo(&p, &i);
         assert_eq!(d.workers_needed, Some(0));
         assert_eq!(d.action, ScalingAction::ScaleDown);
+    }
+
+    #[test]
+    fn an_idle_queue_scales_to_zero_before_mu_is_known() {
+        // A freshly started instance draining its first backlog has no mu yet.
+        // Holding idle workers until the estimator converges would strand them
+        // exactly when scale-to-zero matters most, and hold the RAM this
+        // controller exists to manage.
+        let mut p = slo_params();
+        p.cooldown_ticks = 2;
+        let idle = |ticks_since_change| SloInputs {
+            backlog: 0,
+            running: 4,
+            mu: None,
+            lambda: 0.0,
+            worker_rss: Some(100 * 1024 * 1024),
+            safe_ram_budget: 8 * 1024 * 1024 * 1024,
+            swap_pressure: false,
+            ticks_since_change,
+            needs_probe: true,
+        };
+        // Cooldown-gated, since an AMQP zero can mean "all in flight, unacked".
+        assert_eq!(decide_slo(&p, &idle(0)).action, ScalingAction::Hold);
+        assert_eq!(decide_slo(&p, &idle(2)).action, ScalingAction::ScaleDown);
+    }
+
+    #[test]
+    fn an_idle_queue_respects_the_floor_before_mu_is_known() {
+        let mut p = slo_params();
+        p.min_workers = 2;
+        let i = SloInputs {
+            backlog: 0,
+            running: 2,
+            mu: None,
+            lambda: 0.0,
+            worker_rss: None,
+            safe_ram_budget: 8 * 1024 * 1024 * 1024,
+            swap_pressure: false,
+            ticks_since_change: 10,
+            needs_probe: false,
+        };
+        assert_eq!(decide_slo(&p, &i).action, ScalingAction::Hold);
+    }
+
+    #[test]
+    fn an_idle_queue_scales_to_zero_despite_a_decaying_lambda() {
+        // lambda is an EWMA, so after traffic stops it only ever approaches
+        // zero. `ceil` of any positive value is 1, so without a floor on the
+        // expected work the pool would hold one worker forever and the
+        // scale-to-zero promise would quietly not hold.
+        let p = slo_params();
+        let i = SloInputs {
+            backlog: 0,
+            running: 1,
+            mu: Some(4.3),
+            lambda: 0.001, // residue of long-finished traffic
+            worker_rss: Some(100 * 1024 * 1024),
+            safe_ram_budget: 8 * 1024 * 1024 * 1024,
+            swap_pressure: false,
+            ticks_since_change: 5,
+            needs_probe: false,
+        };
+        let d = decide_slo(&p, &i);
+        assert_eq!(d.workers_needed, Some(0));
+        assert_eq!(d.action, ScalingAction::ScaleDown);
+    }
+
+    #[test]
+    fn a_live_arrival_rate_still_keeps_workers_on_an_empty_queue() {
+        // The floor must not swallow real traffic: an empty queue fed at 20/s
+        // still needs staffing, because work arrives while we drain.
+        let p = slo_params();
+        let i = SloInputs {
+            backlog: 0,
+            running: 0,
+            mu: Some(4.0),
+            lambda: 20.0,
+            worker_rss: Some(100 * 1024 * 1024),
+            safe_ram_budget: 8 * 1024 * 1024 * 1024,
+            swap_pressure: false,
+            ticks_since_change: 5,
+            needs_probe: false,
+        };
+        // 20 msg/s over a 120s horizon is 2400 messages; at 4 msg/s/worker
+        // across that horizon, 5 workers.
+        assert_eq!(decide_slo(&p, &i).workers_needed, Some(5));
     }
 
     #[test]
@@ -519,10 +628,14 @@ mod tests {
 
     #[test]
     fn never_probes_an_empty_queue() {
+        // An empty queue is scaled down, not probed: there is no work to trade
+        // for a measurement, and perturbing an idle pool teaches nothing.
         let mut p = slo_params();
         p.max_workers = 4;
         let mut i = probe_inputs(4, true);
         i.backlog = 0;
-        assert_eq!(decide_slo(&p, &i).action, ScalingAction::Hold);
+        let d = decide_slo(&p, &i);
+        assert_eq!(d.action, ScalingAction::ScaleDown);
+        assert!(!d.probing, "an idle scale-down is not a probe");
     }
 }

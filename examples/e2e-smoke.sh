@@ -9,6 +9,13 @@
 # residual estimator never initialised mu on a growing or steady backlog, so
 # workers_needed stayed at the -1 sentinel forever and this test would fail.
 #
+# The slo run also sanity-checks the magnitude of mu. It deliberately does NOT
+# assert accuracy: the fit needs sustained load to converge, and a short smoke
+# test cannot supply it. Measured against this consumer (~3.4 msgs/s/worker),
+# mu starts around 10 and settles near 3 over about three minutes, so an early
+# reading is an upper bound. The band here catches sign errors and blow-ups,
+# which "mu_source != 0" alone would miss.
+#
 # Requires curl. Starts RabbitMQ in Docker unless EQ_EXTERNAL_RABBIT=1 (CI
 # provides it as a service container).
 #
@@ -32,6 +39,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 CFG="$HERE/config.e2e.$MODE.toml"
 BIN="${EQ_BIN:-./target/debug/effiqueue}"
 EXTERNAL="${EQ_EXTERNAL_RABBIT:-0}"
+# e2e-consumer.sh sleeps EQ_WORK_DELAY per message, so one worker measures a few
+# messages a second. Measured at 3.4/s on a developer laptop; the band is wide
+# enough for slower CI and still catches an estimate that is wrong by multiples.
+MU_MIN="${EQ_MU_MIN:-0.2}"
+MU_MAX="${EQ_MU_MAX:-100.0}"
 
 [ -f "$CFG" ] || { echo "no config for MODE=$MODE ($CFG)"; exit 2; }
 
@@ -74,11 +86,12 @@ for _ in $(seq 1 60); do
 done
 [ "$ready" = 1 ] || { echo "FAIL: management API never came up"; exit 1; }
 
-echo "==> declaring queue '$Q' and publishing a backlog"
+echo "==> declaring queue '$Q' and publishing a backlog (${EQ_BACKLOG:-900} messages)"
 curl -sf -u guest:guest -XDELETE "$API/queues/%2f/$Q" >/dev/null 2>&1 || true
 curl -sf -u guest:guest -H 'content-type: application/json' \
   -XPUT "$API/queues/%2f/$Q" -d '{"durable":true}' >/dev/null
-for i in $(seq 1 300); do
+BACKLOG="${EQ_BACKLOG:-900}"
+for i in $(seq 1 "$BACKLOG"); do
   curl -sf -u guest:guest -H 'content-type: application/json' \
     -XPOST "$API/exchanges/%2f/amq.default/publish" \
     -d "{\"properties\":{},\"routing_key\":\"$Q\",\"payload\":\"job-$i\",\"payload_encoding\":\"string\"}" \
@@ -120,6 +133,17 @@ if [ "$MODE" = slo ]; then
     exit 1
   fi
   echo "==> mu measured and workers_needed derived"
+
+  echo "==> sanity-checking mu ($MU_MIN..$MU_MAX msgs/s/worker; not an accuracy check)"
+  mu="$(metric effiqueue_mu || echo 0)"
+  if ! awk -v m="$mu" -v lo="$MU_MIN" -v hi="$MU_MAX" 'BEGIN{exit !(m>=lo && m<=hi)}'; then
+    echo "FAIL: mu=$mu is outside the sane band $MU_MIN..$MU_MAX."
+    echo "      The consumer runs at roughly 3.4 msgs/s/worker, so this is not a"
+    echo "      slow-convergence artefact — check poll_interval against the broker's"
+    echo "      statistics refresh interval (~5s), and the sign of the fitted slope."
+    exit 1
+  fi
+  echo "==> mu=$mu is within the sane band"
 fi
 
 echo "==> purging the queue -> expecting scale-down to 0"

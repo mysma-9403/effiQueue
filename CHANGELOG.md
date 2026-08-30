@@ -90,6 +90,10 @@ upgrade** — see the note below for what it was actually doing.
 
 ### Added
 
+- The config validator warns when `poll_interval` is shorter than the broker's
+  statistics refresh interval, which produces a stale-then-cliff backlog series
+  and a `mu` measured at several times the true rate.
+
 - **RabbitMQ management API support** (default on, auto-derived from
   `queue_connection`). Supplies `ack_details.rate` (= `mu*n`) and
   `publish_details.rate` (= `lambda`) directly, plus a backlog that includes

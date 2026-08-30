@@ -340,6 +340,20 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         });
     }
 
+    // RabbitMQ recomputes queue statistics on an interval of its own
+    // (collect_statistics_interval, 5s by default). Polling faster than that
+    // yields a backlog series of flat stretches broken by cliffs, and a
+    // regression fitted to it reads the cliffs as worker throughput — measured
+    // at 7x the true rate on a 2s interval.
+    let management_enabled = raw.management.unwrap_or(true);
+    if management_enabled && poll_interval < Duration::from_secs(5) {
+        tracing::warn!(
+            poll_interval_s = poll_interval.as_secs_f64(),
+            "poll_interval is shorter than the broker's statistics refresh interval (~5s); \
+             backlog readings will be stale between refreshes and the mu estimate unreliable"
+        );
+    }
+
     let alpha_mu = raw.alpha_mu.unwrap_or(0.3);
     let alpha_lambda = raw.alpha_lambda.unwrap_or(0.3);
     for (name, a) in [("alpha_mu", alpha_mu), ("alpha_lambda", alpha_lambda)] {

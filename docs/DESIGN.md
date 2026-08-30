@@ -135,6 +135,16 @@ variance is correspondingly high. Under bursty arrivals the fallback needs on th
 order of 60–180 windows to be accurate — minutes to tens of minutes at a 10 s
 poll interval. Prefer the direct path whenever the management API is available.
 
+Measured end to end against a consumer running at ~3.4 msgs/s/worker, the fit's
+first estimate was ~10.8 and decayed to ~2.9 over about three minutes of
+sustained load. Early readings are upper bounds, not answers.
+
+The sampling rate matters as much as the window length. RabbitMQ recomputes
+queue statistics on its own interval (`collect_statistics_interval`, 5 s by
+default); polling faster produces a backlog series of flat stretches broken by
+cliffs, and a slope fitted to that reads the cliffs as worker throughput —
+measured at 7x the true rate on a 2 s interval. The config validator warns.
+
 ### 2.5 The RAM budget
 
 The binding constraint no elastic autoscaler models: this machine has a finite,

@@ -20,20 +20,32 @@ pub enum StopOutcome {
     Error,
 }
 
+/// Signal a worker's whole process group, falling back to the single process.
+///
+/// Workers are spawned as group leaders (`process_group(0)`), so the negated PID
+/// addresses the worker *and* anything it forked — the `sh` wrapper under
+/// `shell = true`, or a runtime that spawns helpers.
+#[cfg(unix)]
+fn signal_group(pid: u32, signal: nix::sys::signal::Signal) -> std::io::Result<()> {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    match kill(Pid::from_raw(-(pid as i32)), signal) {
+        Ok(()) => Ok(()),
+        // No such group (the worker never became a leader) — target the process.
+        Err(_) => kill(Pid::from_raw(pid as i32), signal).map_err(std::io::Error::other),
+    }
+}
+
 /// Ask a worker to terminate gracefully (Unix: `SIGTERM`). Does not wait.
 #[cfg(unix)]
 pub fn signal_terminate(pid: u32) -> std::io::Result<()> {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-    kill(Pid::from_raw(pid as i32), Signal::SIGTERM).map_err(std::io::Error::other)
+    signal_group(pid, nix::sys::signal::Signal::SIGTERM)
 }
 
 /// Force-kill a worker (Unix: `SIGKILL`), falling back to `Child::kill()`.
 #[cfg(unix)]
 pub fn force_kill(pid: u32, child: &mut Child) -> std::io::Result<()> {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-    match kill(Pid::from_raw(pid as i32), Signal::SIGKILL) {
+    match signal_group(pid, nix::sys::signal::Signal::SIGKILL) {
         Ok(()) => Ok(()),
         Err(_) => child.kill(),
     }

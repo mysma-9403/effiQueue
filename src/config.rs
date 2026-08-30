@@ -62,6 +62,11 @@ pub struct Config {
     pub ram_ratio_cap: f64,
     /// Optional Prometheus `/metrics` listen address, e.g. `127.0.0.1:9101`.
     pub metrics_addr: Option<String>,
+    /// Use the RabbitMQ management API for backlog + rates when reachable.
+    pub management: bool,
+    /// Explicit `http://[user:pass@]host:port` management endpoint. Overrides
+    /// the address derived from `queue_connection`.
+    pub management_url: Option<String>,
 }
 
 /// Raw, unvalidated shape read from disk.
@@ -94,6 +99,8 @@ struct RawConfig {
     depth_threshold: Option<u32>,
     ram_ratio_cap: Option<f64>,
     metrics_addr: Option<String>,
+    management: Option<bool>,
+    management_url: Option<String>,
     /// TOML `[[program]]` array (multi-program mode). Absent for single-program / `.conf`.
     #[serde(rename = "program")]
     programs: Option<Vec<RawProgram>>,
@@ -217,6 +224,8 @@ fn parse_supervisor_conf(text: &str) -> Result<RawConfig, ConfigError> {
             "depth_threshold" => raw.depth_threshold = Some(parse_u32(&value, "depth_threshold")?),
             "ram_ratio_cap" => raw.ram_ratio_cap = Some(parse_f64(&value, "ram_ratio_cap")?),
             "metrics_addr" => raw.metrics_addr = Some(value),
+            "management" => raw.management = Some(parse_bool(&value, "management")?),
+            "management_url" => raw.management_url = Some(value),
             _ => {} // ignore unknown keys
         }
     }
@@ -261,6 +270,16 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         return Err(ConfigError::Invalid {
             key: "min_workers".into(),
             reason: format!("min_workers ({min_workers}) > max_workers ({max_workers})"),
+        });
+    }
+
+    // Only one backend exists today. Accepting anything else here would silently
+    // read RabbitMQ while the operator believes they configured Redis.
+    let queue = raw.queue.unwrap_or_else(|| "rabbitmq".to_string());
+    if !queue.eq_ignore_ascii_case("rabbitmq") {
+        return Err(ConfigError::Invalid {
+            key: "queue".into(),
+            reason: format!("unsupported backend '{queue}' (only 'rabbitmq' is implemented)"),
         });
     }
 
@@ -330,7 +349,7 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         poll_interval,
         drain_timeout,
         shell: raw.shell.unwrap_or(false),
-        queue: raw.queue.unwrap_or_else(|| "rabbitmq".to_string()),
+        queue,
         queue_connection,
         queue_name,
         autostart: raw.autostart.unwrap_or(true),
@@ -346,6 +365,8 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         depth_threshold: raw.depth_threshold.unwrap_or(40),
         ram_ratio_cap: raw.ram_ratio_cap.unwrap_or(0.9),
         metrics_addr: raw.metrics_addr,
+        management: raw.management.unwrap_or(true),
+        management_url: raw.management_url,
     })
 }
 
@@ -402,7 +423,13 @@ pub fn parse_duration(s: &str) -> Result<Duration, ConfigError> {
             })
         }
     };
-    Ok(Duration::from_secs(n * mult))
+    // Release builds have overflow checks off, so an unchecked multiply would
+    // silently wrap a nonsense value into a plausible-looking one.
+    let secs = n.checked_mul(mult).ok_or_else(|| ConfigError::Invalid {
+        key: "duration".into(),
+        reason: format!("'{s}' overflows the representable range"),
+    })?;
+    Ok(Duration::from_secs(secs))
 }
 
 /// Parse a byte size like `12GB`, `2gb`, `512MB` (base 1024, bare number = bytes).
@@ -427,7 +454,10 @@ pub fn parse_bytes(s: &str) -> Result<u64, ConfigError> {
             })
         }
     };
-    Ok(n * mult)
+    n.checked_mul(mult).ok_or_else(|| ConfigError::Invalid {
+        key: "bytes".into(),
+        reason: format!("'{s}' overflows the representable range"),
+    })
 }
 
 /// Expand the `%(process_num)02d` placeholder to a zero-padded index.
@@ -511,6 +541,13 @@ mod tests {
         assert!(matches!(validate(raw), Err(ConfigError::Invalid { .. })));
     }
 
+    fn slo_base_with_drain() -> RawConfig {
+        RawConfig {
+            slo_drain_time: Some("120s".into()),
+            ..slo_base()
+        }
+    }
+
     fn slo_base() -> RawConfig {
         RawConfig {
             mode: Some("slo".into()),
@@ -551,6 +588,62 @@ mod tests {
         assert_eq!(cfg.slo_drain_time, Some(Duration::from_secs(120)));
         assert_eq!(cfg.ram_headroom, Some(2 * 1024 * 1024 * 1024));
         assert_eq!(cfg.ram_budget, None);
+    }
+
+    #[test]
+    fn rejects_an_unimplemented_queue_backend() {
+        // Silently reading RabbitMQ while the operator configured Redis is worse
+        // than refusing to start.
+        let raw = RawConfig {
+            queue: Some("redis".into()),
+            ..slo_base_with_drain()
+        };
+        let err = validate(raw).unwrap_err();
+        assert!(matches!(&err, ConfigError::Invalid { key, .. } if key == "queue"));
+        assert!(err.to_string().contains("redis"));
+    }
+
+    #[test]
+    fn accepts_the_supported_backend_case_insensitively() {
+        let raw = RawConfig {
+            queue: Some("RabbitMQ".into()),
+            ..slo_base_with_drain()
+        };
+        assert_eq!(validate(raw).unwrap().queue, "RabbitMQ");
+    }
+
+    #[test]
+    fn byte_and_duration_overflow_is_an_error_not_a_wrap() {
+        // Release builds disable overflow checks, so an unchecked multiply would
+        // turn this into a small, plausible-looking number.
+        assert!(parse_bytes("18000000000TB").is_err());
+        assert!(parse_duration("99999999999999999999h").is_err());
+        // Values that genuinely fit still parse.
+        assert_eq!(parse_bytes("1024TB").unwrap(), 1024 * 1024u64.pow(4));
+        assert_eq!(parse_duration("48h").unwrap(), Duration::from_secs(172_800));
+    }
+
+    #[test]
+    fn management_defaults_on_and_is_overridable() {
+        assert!(validate(slo_base_with_drain()).unwrap().management);
+        let raw = RawConfig {
+            management: Some(false),
+            management_url: Some("http://mgmt:15672".into()),
+            ..slo_base_with_drain()
+        };
+        let cfg = validate(raw).unwrap();
+        assert!(!cfg.management);
+        assert_eq!(cfg.management_url.as_deref(), Some("http://mgmt:15672"));
+    }
+
+    #[test]
+    fn supervisor_conf_reads_the_management_keys() {
+        let text = "[program:demo]\n  mode=threshold\n  command=echo hi\n  max_workers=3\n  \
+                    queue_connection=amqp://localhost\n  queue_name=q\n  management=false\n  \
+                    management_url=http://mgmt:15672\n";
+        let cfg = validate(parse_supervisor_conf(text).unwrap()).unwrap();
+        assert!(!cfg.management);
+        assert_eq!(cfg.management_url.as_deref(), Some("http://mgmt:15672"));
     }
 
     #[test]

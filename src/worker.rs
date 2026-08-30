@@ -7,6 +7,13 @@ use crate::platform::{self, StopOutcome};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// A worker that exits sooner than this is treated as a crash, not a self-exit.
+const MIN_HEALTHY_UPTIME: Duration = Duration::from_secs(10);
+/// Consecutive crashes tolerated before spawning is backed off.
+const CRASHES_BEFORE_BACKOFF: u32 = 3;
+/// Ceiling on the crash-loop back-off.
+const MAX_SPAWN_BACKOFF: Duration = Duration::from_secs(300);
+
 /// A single tracked worker process.
 pub struct TrackedWorker {
     /// Logical index (drives `%(process_num)02d` and the display name).
@@ -15,13 +22,9 @@ pub struct TrackedWorker {
     pub pid: u32,
     /// Display name (from `process_name`) — logs/metrics only, never discovery.
     pub name: String,
-    /// Retained handle — the source of PID + kill, dropped in the old code.
+    /// Retained handle — the source of PID + kill.
     pub child: Child,
-    /// RSS (bytes) sampled shortly after spawn. Foundation for Phase 1. TODO Phase 1.
-    #[allow(dead_code)]
-    pub spawn_rss: Option<u64>,
-    /// When the worker started. Foundation for age/backoff. TODO Phase 1.
-    #[allow(dead_code)]
+    /// When the worker started — drives crash-loop detection.
     pub started_at: Instant,
 }
 
@@ -66,11 +69,16 @@ impl TrackedWorker {
             c.args(rest);
             c
         };
-        let child = cmd
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(WorkerError::Spawn)?;
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        // Put the worker in its own process group so a stop reaches the whole
+        // tree. Without this, `shell = true` only ever signals the `sh`, and any
+        // worker that forks leaves children behind.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let child = cmd.spawn().map_err(WorkerError::Spawn)?;
         let pid = child.id();
         let name = crate::config::expand_process_num(name_template, id);
         Ok(TrackedWorker {
@@ -78,7 +86,6 @@ impl TrackedWorker {
             pid,
             name,
             child,
-            spawn_rss: None,
             started_at: Instant::now(),
         })
     }
@@ -122,6 +129,18 @@ impl TrackedWorker {
     }
 }
 
+/// A worker that exited on its own, with enough context to judge whether it
+/// crashed or finished cleanly.
+#[derive(Debug)]
+pub struct ExitedWorker {
+    pub id: u32,
+    pub pid: u32,
+    pub status: std::process::ExitStatus,
+    pub uptime: Duration,
+    /// Exited faster than [`MIN_HEALTHY_UPTIME`] — treated as a crash.
+    pub crashed: bool,
+}
+
 /// The set of live workers for one program. Identity/count come from this
 /// registry, never from scanning process names.
 pub struct WorkerPool {
@@ -130,6 +149,10 @@ pub struct WorkerPool {
     command: String,
     name_template: String,
     shell: bool,
+    /// Consecutive short-lived exits — drives the crash-loop back-off.
+    consecutive_crashes: u32,
+    /// Spawning is suppressed until this instant.
+    blocked_until: Option<Instant>,
 }
 
 impl WorkerPool {
@@ -140,6 +163,8 @@ impl WorkerPool {
             command,
             name_template,
             shell,
+            consecutive_crashes: 0,
+            blocked_until: None,
         }
     }
 
@@ -157,47 +182,112 @@ impl WorkerPool {
         self.workers.iter().map(|w| w.pid).collect()
     }
 
-    /// Scale up by one. Returns the new worker's PID.
-    pub fn spawn_one(&mut self) -> Result<u32, WorkerError> {
+    /// Whether spawning is currently allowed. A command that dies on startup
+    /// would otherwise be respawned once per tick forever.
+    pub fn can_spawn(&self) -> bool {
+        match self.blocked_until {
+            Some(until) => Instant::now() >= until,
+            None => true,
+        }
+    }
+
+    /// How much longer spawning stays suppressed, if it does.
+    pub fn spawn_backoff_remaining(&self) -> Option<Duration> {
+        self.blocked_until
+            .and_then(|until| until.checked_duration_since(Instant::now()))
+    }
+
+    /// Scale up by one. Returns the new worker's PID, or `None` while the
+    /// crash-loop back-off is active.
+    pub fn spawn_one(&mut self) -> Result<Option<u32>, WorkerError> {
+        if !self.can_spawn() {
+            return Ok(None);
+        }
         let id = self.next_id;
         let w = TrackedWorker::spawn(id, &self.command, &self.name_template, self.shell)?;
         let pid = w.pid;
         tracing::info!(worker_id = id, name = %w.name, pid, "started worker");
         self.next_id += 1;
         self.workers.push(w);
-        Ok(pid)
+        Ok(Some(pid))
     }
 
-    /// Scale down by one (graceful).
-    pub async fn stop_one(&mut self, drain_timeout: Duration) -> Option<StopOutcome> {
-        let mut w = self.workers.pop()?;
-        let outcome = w.request_stop(drain_timeout).await;
-        tracing::info!(worker_id = w.id, pid = w.pid, ?outcome, "stopped worker");
-        Some(outcome)
+    /// Remove the newest worker from the registry and hand it to the caller.
+    ///
+    /// The pool's count drops immediately while the caller drains the process in
+    /// the background, so a slow drain never stalls the control loop.
+    pub fn detach_one(&mut self) -> Option<TrackedWorker> {
+        self.workers.pop()
     }
 
-    /// Remove workers that exited on their own (crash or self-exit).
-    /// Foundation for autorestart (Phase 1).
-    pub fn reap_exited(&mut self) -> Vec<(u32, std::process::ExitStatus)> {
+    /// Remove workers that exited on their own and update crash-loop state.
+    pub fn reap_exited(&mut self) -> Vec<ExitedWorker> {
         let mut dead = Vec::new();
         let mut i = 0;
         while i < self.workers.len() {
             if let Some(status) = self.workers[i].poll_exited() {
                 let w = self.workers.remove(i);
-                dead.push((w.id, status));
+                let uptime = w.started_at.elapsed();
+                dead.push(ExitedWorker {
+                    id: w.id,
+                    pid: w.pid,
+                    status,
+                    uptime,
+                    crashed: uptime < MIN_HEALTHY_UPTIME,
+                });
             } else {
                 i += 1;
             }
         }
+        for w in &dead {
+            self.record_exit(w.crashed);
+        }
         dead
     }
 
-    /// Gracefully stop every worker (used on daemon shutdown).
-    pub async fn shutdown_all(&mut self, drain_timeout: Duration) {
-        while let Some(mut w) = self.workers.pop() {
-            w.request_stop(drain_timeout).await;
+    /// Track consecutive crashes and arm an exponential back-off once a command
+    /// looks broken rather than merely unlucky.
+    fn record_exit(&mut self, crashed: bool) {
+        if !crashed {
+            self.consecutive_crashes = 0;
+            self.blocked_until = None;
+            return;
         }
+        self.consecutive_crashes = self.consecutive_crashes.saturating_add(1);
+        if self.consecutive_crashes < CRASHES_BEFORE_BACKOFF {
+            return;
+        }
+        let exponent = (self.consecutive_crashes - CRASHES_BEFORE_BACKOFF).min(10);
+        let backoff = MIN_HEALTHY_UPTIME
+            .saturating_mul(1u32 << exponent)
+            .min(MAX_SPAWN_BACKOFF);
+        self.blocked_until = Some(Instant::now() + backoff);
+        tracing::warn!(
+            consecutive_crashes = self.consecutive_crashes,
+            backoff_s = backoff.as_secs(),
+            command = %self.command,
+            "worker command keeps exiting immediately; backing off before respawning"
+        );
     }
+
+    /// Gracefully stop every worker (used on daemon shutdown). Workers are
+    /// drained concurrently, so shutdown costs one `drain_timeout`, not N.
+    pub async fn shutdown_all(&mut self, drain_timeout: Duration) {
+        let mut set = tokio::task::JoinSet::new();
+        for mut w in std::mem::take(&mut self.workers) {
+            set.spawn(async move {
+                let outcome = w.request_stop(drain_timeout).await;
+                tracing::info!(worker_id = w.id, pid = w.pid, ?outcome, "stopped worker");
+            });
+        }
+        while set.join_next().await.is_some() {}
+    }
+}
+
+/// Drain a detached worker in the background.
+pub async fn drain_detached(mut w: TrackedWorker, drain_timeout: Duration) {
+    let outcome = w.request_stop(drain_timeout).await;
+    tracing::info!(worker_id = w.id, pid = w.pid, ?outcome, "stopped worker");
 }
 
 #[cfg(test)]
@@ -212,21 +302,82 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn spawn_and_request_stop_sleeper() {
+    fn sleeper_pool() -> WorkerPool {
         #[cfg(unix)]
         let cmd = "sleep 30";
         #[cfg(windows)]
         let cmd = "cmd /C timeout /T 30 /NOBREAK";
+        WorkerPool::new(cmd.to_string(), "w_%(process_num)02d".to_string(), false)
+    }
 
-        let mut pool = WorkerPool::new(cmd.to_string(), "w_%(process_num)02d".to_string(), false);
-        pool.spawn_one().unwrap();
+    #[tokio::test]
+    async fn spawn_and_request_stop_sleeper() {
+        let mut pool = sleeper_pool();
+        pool.spawn_one().unwrap().expect("spawn allowed");
         assert_eq!(pool.len(), 1);
-        let outcome = pool.stop_one(Duration::from_millis(300)).await;
+        let w = pool.detach_one().expect("worker detached");
+        // Detaching drops the count immediately; the drain happens off the loop.
+        assert_eq!(pool.len(), 0);
+        let mut w = w;
+        let outcome = w.request_stop(Duration::from_millis(300)).await;
         assert!(matches!(
             outcome,
-            Some(StopOutcome::Killed) | Some(StopOutcome::Drained)
+            StopOutcome::Killed | StopOutcome::Drained
         ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_drains_every_worker() {
+        let mut pool = sleeper_pool();
+        for _ in 0..3 {
+            pool.spawn_one().unwrap().expect("spawn allowed");
+        }
+        assert_eq!(pool.len(), 3);
+        pool.shutdown_all(Duration::from_millis(200)).await;
         assert_eq!(pool.len(), 0);
+        assert!(pool.is_empty());
+    }
+
+    #[tokio::test]
+    async fn crash_looping_command_gets_backed_off() {
+        // `false` exits immediately, so every spawn counts as a crash.
+        #[cfg(unix)]
+        let cmd = "false";
+        #[cfg(windows)]
+        let cmd = "cmd /C exit 1";
+        let mut pool = WorkerPool::new(cmd.to_string(), "w".to_string(), false);
+
+        for _ in 0..CRASHES_BEFORE_BACKOFF {
+            assert!(pool.can_spawn(), "should still be allowed to spawn");
+            pool.spawn_one().unwrap().expect("spawn allowed");
+            // Give the process a moment to die, then reap it.
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let dead = pool.reap_exited();
+            assert_eq!(dead.len(), 1);
+            assert!(dead[0].crashed, "a sub-10s exit must count as a crash");
+        }
+
+        assert!(
+            !pool.can_spawn(),
+            "back-off must engage after repeat crashes"
+        );
+        assert!(pool.spawn_backoff_remaining().is_some());
+        // A blocked spawn is not an error — it reports that nothing started.
+        assert_eq!(pool.spawn_one().unwrap(), None);
+        assert_eq!(pool.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_healthy_exit_clears_the_crash_counter() {
+        let mut pool = sleeper_pool();
+        pool.spawn_one().unwrap().expect("spawn allowed");
+        // Forge the history: two crashes recorded, then a clean long-lived exit.
+        pool.record_exit(true);
+        pool.record_exit(true);
+        assert_eq!(pool.consecutive_crashes, 2);
+        pool.record_exit(false);
+        assert_eq!(pool.consecutive_crashes, 0);
+        assert!(pool.can_spawn());
+        pool.shutdown_all(Duration::from_millis(200)).await;
     }
 }

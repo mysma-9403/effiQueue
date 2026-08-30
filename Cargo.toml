@@ -14,6 +14,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signa
 lapin = "2.3.1"
 sysinfo = "0.33"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"

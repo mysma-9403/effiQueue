@@ -1,10 +1,11 @@
 //! Pure, testable scaling logic — no filesystem, processes, or network.
 //!
-//! Implements the Budget-Bound SLO Controller (DESIGN §2–§3): measured `mu` via
-//! scale-by-one perturbation, `lambda` as the queue-balance residual, Little's
-//! Law for `workers_needed`, a RAM budget for `workers_capacity`, and the
-//! signature Feasibility Gap when the SLO cannot fit on this host. Also hosts
-//! the simpler `threshold` fallback mode.
+//! Implements the Budget-Bound SLO Controller (DESIGN §2–§3): Little's Law for
+//! `workers_needed`, a RAM budget for `workers_capacity`, and the signature
+//! Feasibility Gap when the SLO cannot fit on this host. Also hosts the simpler
+//! `threshold` fallback mode.
+//!
+//! `mu` and `lambda` themselves are measured in [`crate::estimator`].
 
 use std::time::Duration;
 
@@ -26,118 +27,6 @@ pub struct FeasibilityGap {
     /// Best drain achievable at full capacity; `None` = never (mu*cap <= lambda).
     pub best_drain: Option<Duration>,
     pub slo_drain_time: Duration,
-}
-
-/// Exponentially-weighted moving average (DESIGN §6).
-#[derive(Debug, Clone)]
-pub struct EwmaEstimator {
-    value: f64,
-    alpha: f64,
-    initialized: bool,
-}
-
-impl EwmaEstimator {
-    pub fn new(alpha: f64) -> Self {
-        Self {
-            value: 0.0,
-            alpha,
-            initialized: false,
-        }
-    }
-
-    pub fn update(&mut self, sample: f64) {
-        if self.initialized {
-            self.value = self.alpha * sample + (1.0 - self.alpha) * self.value;
-        } else {
-            self.value = sample;
-            self.initialized = true;
-        }
-    }
-
-    pub fn value(&self) -> f64 {
-        self.value
-    }
-
-    pub fn is_initialized(&self) -> bool {
-        self.initialized
-    }
-}
-
-/// Live estimators for throughput (`mu`) and arrival rate (`lambda`).
-#[derive(Debug, Clone)]
-pub struct Estimators {
-    mu: EwmaEstimator,
-    lambda: EwmaEstimator,
-    last_backlog: Option<u64>,
-}
-
-impl Estimators {
-    pub fn new(alpha_mu: f64, alpha_lambda: f64) -> Self {
-        Self {
-            mu: EwmaEstimator::new(alpha_mu),
-            lambda: EwmaEstimator::new(alpha_lambda),
-            last_backlog: None,
-        }
-    }
-
-    /// Observe one control window (DESIGN §2.2–§2.3).
-    ///
-    /// `running_in_window` = worker count active during the elapsed `dt`.
-    /// `interference` = the running count changed outside our own ±1 step
-    /// (operator/crash/self-exit) — the `mu` sample is quarantined.
-    pub fn observe(
-        &mut self,
-        backlog: u32,
-        running_in_window: u32,
-        dt: Duration,
-        interference: bool,
-    ) {
-        let dt_s = dt.as_secs_f64();
-        if dt_s <= 0.0 {
-            return;
-        }
-        let backlog_f = backlog as f64;
-        let Some(prev) = self.last_backlog else {
-            self.last_backlog = Some(backlog as u64);
-            return;
-        };
-        let delta_backlog = backlog_f - prev as f64;
-        let running = running_in_window as f64;
-
-        // lambda = residual of the balance, using the *previous* mu (loop broken by one tick).
-        let mu_prev = if self.mu.is_initialized() {
-            self.mu.value()
-        } else {
-            0.0
-        };
-        let drained = mu_prev * running * dt_s;
-        let lambda_raw = ((delta_backlog + drained) / dt_s).max(0.0);
-        self.lambda.update(lambda_raw);
-
-        // mu from the scale-by-one perturbation, using the *current* lambda.
-        if !interference && running_in_window > 0 {
-            let observed_drain = self.lambda.value() * dt_s - delta_backlog;
-            if observed_drain > 0.0 {
-                let mu_raw = observed_drain / (running * dt_s);
-                self.mu.update(mu_raw);
-            }
-        }
-
-        self.last_backlog = Some(backlog as u64);
-    }
-
-    pub fn lambda(&self) -> f64 {
-        self.lambda.value()
-    }
-
-    /// `mu` only if a clean, positive sample has been observed.
-    pub fn mu(&self) -> Option<f64> {
-        if self.mu.is_initialized() && self.mu.value() > 0.0 {
-            Some(self.mu.value())
-        } else {
-            None
-        }
-    }
 }
 
 /// Tuning + limits for the SLO controller.
@@ -167,6 +56,9 @@ pub struct SloInputs {
     pub safe_ram_budget: u64,
     pub swap_pressure: bool,
     pub ticks_since_change: u32,
+    /// The estimator cannot identify `mu` until the worker count varies. When
+    /// set, the controller may deliberately step a worker to create that spread.
+    pub needs_probe: bool,
 }
 
 /// Full result of an SLO decision (diagnostics + action).
@@ -176,6 +68,8 @@ pub struct Decision {
     pub workers_needed: Option<u32>,
     pub workers_capacity: u32,
     pub feasibility_gap: Option<FeasibilityGap>,
+    /// The action was taken to make `mu` observable, not to meet the SLO.
+    pub probing: bool,
 }
 
 /// The SLO controller decision for one tick (DESIGN §2.4–§2.6, §3).
@@ -226,37 +120,50 @@ pub fn decide_slo(p: &SloParams, i: &SloInputs) -> Decision {
         _ => None,
     };
 
-    let action = decide_action(p, i, workers_needed, capacity);
+    let (action, probing) = decide_action(p, i, workers_needed, capacity);
 
     Decision {
         action,
         workers_needed,
         workers_capacity: capacity,
         feasibility_gap,
+        probing,
     }
 }
 
+/// Returns the action and whether it was taken purely to make `mu` observable.
 fn decide_action(
     p: &SloParams,
     i: &SloInputs,
     needed: Option<u32>,
     capacity: u32,
-) -> ScalingAction {
+) -> (ScalingAction, bool) {
     // Meet the floor / ceiling promptly (ignore cooldown).
     if i.running < p.min_workers {
-        return ScalingAction::ScaleUp;
+        return (ScalingAction::ScaleUp, false);
     }
     if i.running > p.max_workers {
-        return ScalingAction::ScaleDown;
+        return (ScalingAction::ScaleDown, false);
     }
 
     let Some(needed) = needed else {
-        // Bootstrap: no reliable mu yet. Cautiously scale up if there is work
-        // and room, so mu can be measured; otherwise hold.
-        if i.backlog > 0 && i.running < capacity && i.running < p.max_workers {
-            return ScalingAction::ScaleUp;
+        // Bootstrap: no reliable mu yet.
+        if i.backlog == 0 {
+            return (ScalingAction::Hold, false);
         }
-        return ScalingAction::Hold;
+        // Growing the pool both drains the backlog and varies `n`, which is what
+        // makes mu identifiable. Prefer it whenever there is room.
+        if i.running < capacity && i.running < p.max_workers {
+            return (ScalingAction::ScaleUp, i.needs_probe);
+        }
+        // Pinned at the ceiling with mu still unknown: the worker count would
+        // never move again and mu would stay unobservable forever. Step one
+        // worker down to buy the spread the regression needs. This is the
+        // scale-by-one perturbation the design is built on.
+        if i.needs_probe && i.running > p.min_workers {
+            return (ScalingAction::ScaleDown, true);
+        }
+        return (ScalingAction::Hold, false);
     };
 
     let target = needed.min(capacity).clamp(p.min_workers, p.max_workers);
@@ -266,18 +173,18 @@ fn decide_action(
     if target > i.running.saturating_add(p.hysteresis) {
         // Scale-up may bypass cooldown on a spike (never scale-down).
         if cooldown_ok || spike {
-            ScalingAction::ScaleUp
+            (ScalingAction::ScaleUp, false)
         } else {
-            ScalingAction::Hold
+            (ScalingAction::Hold, false)
         }
     } else if target < i.running.saturating_sub(p.hysteresis) {
         if cooldown_ok {
-            ScalingAction::ScaleDown
+            (ScalingAction::ScaleDown, false)
         } else {
-            ScalingAction::Hold
+            (ScalingAction::Hold, false)
         }
     } else {
-        ScalingAction::Hold
+        (ScalingAction::Hold, false)
     }
 }
 
@@ -288,6 +195,8 @@ pub struct ThresholdParams {
     pub ram_ratio_cap: f64,
     pub min_workers: u32,
     pub max_workers: u32,
+    /// Ticks to wait after a change before the next one.
+    pub cooldown_ticks: u32,
 }
 
 /// Inputs for the `threshold` fallback decision.
@@ -296,15 +205,26 @@ pub struct ThresholdInputs {
     pub backlog: u32,
     pub running: u32,
     pub ram_ratio: f64,
+    pub ticks_since_change: u32,
 }
 
 /// Simple depth + RAM% fallback (mirrors the pre-SLO behavior, safely bounded).
+///
+/// Scale-down is cooldown-gated. Without that gate an AMQP-only depth reading —
+/// which counts messages *ready*, not messages in flight — reports zero the
+/// instant the last message is delivered, while workers are still processing it,
+/// and the pool flaps down and straight back up.
 pub fn decide_threshold(p: &ThresholdParams, i: &ThresholdInputs) -> ScalingAction {
     if i.running < p.min_workers {
         return ScalingAction::ScaleUp;
     }
+    let cooldown_ok = i.ticks_since_change >= p.cooldown_ticks;
     if i.backlog == 0 && i.running > p.min_workers {
-        return ScalingAction::ScaleDown;
+        return if cooldown_ok {
+            ScalingAction::ScaleDown
+        } else {
+            ScalingAction::Hold
+        };
     }
     if i.backlog > p.depth_threshold && i.running < p.max_workers && i.ram_ratio < p.ram_ratio_cap {
         return ScalingAction::ScaleUp;
@@ -328,16 +248,6 @@ mod tests {
     }
 
     #[test]
-    fn ewma_initializes_then_smooths() {
-        let mut e = EwmaEstimator::new(0.5);
-        assert!(!e.is_initialized());
-        e.update(10.0);
-        assert_eq!(e.value(), 10.0);
-        e.update(20.0);
-        assert_eq!(e.value(), 15.0);
-    }
-
-    #[test]
     fn design_example_feasibility_gap() {
         // DESIGN §3.3: backlog 50000, H=120s, mu=8, lambda=200, rss=512MB, budget=12GB.
         let p = slo_params();
@@ -350,6 +260,7 @@ mod tests {
             safe_ram_budget: 12 * 1024 * 1024 * 1024,
             swap_pressure: false,
             ticks_since_change: 0,
+            needs_probe: false,
         };
         let d = decide_slo(&p, &i);
         assert_eq!(d.workers_needed, Some(78));
@@ -373,6 +284,7 @@ mod tests {
             safe_ram_budget: 8 * 1024 * 1024 * 1024,
             swap_pressure: false,
             ticks_since_change: 5,
+            needs_probe: false,
         };
         let d = decide_slo(&p, &i);
         assert_eq!(d.workers_needed, Some(0));
@@ -391,6 +303,7 @@ mod tests {
             safe_ram_budget: 8 * 1024 * 1024 * 1024,
             swap_pressure: false,
             ticks_since_change: 0,
+            needs_probe: false,
         };
         assert_eq!(decide_slo(&p, &i).action, ScalingAction::ScaleUp);
     }
@@ -408,6 +321,7 @@ mod tests {
             safe_ram_budget: 64 * 1024 * 1024 * 1024,
             swap_pressure: true,
             ticks_since_change: 10,
+            needs_probe: false,
         };
         let d = decide_slo(&p, &i);
         assert_eq!(d.workers_capacity, 4); // clamped to running under swap pressure
@@ -428,6 +342,7 @@ mod tests {
             safe_ram_budget: 64 * 1024 * 1024 * 1024,
             swap_pressure: false,
             ticks_since_change: 0, // within cooldown
+            needs_probe: false,
         };
         // backlog 5000 > spike_backlog 1000 -> fast-path scale up despite cooldown.
         assert_eq!(decide_slo(&p, &base).action, ScalingAction::ScaleUp);
@@ -440,53 +355,106 @@ mod tests {
             ram_ratio_cap: 0.9,
             min_workers: 0,
             max_workers: 10,
+            cooldown_ticks: 0,
+        };
+        let inputs = |backlog, running| ThresholdInputs {
+            backlog,
+            running,
+            ram_ratio: 0.5,
+            ticks_since_change: 5,
         };
         assert_eq!(
-            decide_threshold(
-                &p,
-                &ThresholdInputs {
-                    backlog: 100,
-                    running: 1,
-                    ram_ratio: 0.5
-                }
-            ),
+            decide_threshold(&p, &inputs(100, 1)),
             ScalingAction::ScaleUp
         );
         assert_eq!(
-            decide_threshold(
-                &p,
-                &ThresholdInputs {
-                    backlog: 0,
-                    running: 2,
-                    ram_ratio: 0.5
-                }
-            ),
+            decide_threshold(&p, &inputs(0, 2)),
             ScalingAction::ScaleDown
         );
-        assert_eq!(
-            decide_threshold(
-                &p,
-                &ThresholdInputs {
-                    backlog: 10,
-                    running: 2,
-                    ram_ratio: 0.5
-                }
-            ),
-            ScalingAction::Hold
-        );
+        assert_eq!(decide_threshold(&p, &inputs(10, 2)), ScalingAction::Hold);
     }
 
     #[test]
-    fn estimators_measure_mu_and_lambda() {
-        let mut est = Estimators::new(1.0, 1.0); // alpha=1 -> take latest sample
-        let dt = Duration::from_secs(1);
-        // First observe just seeds last_backlog.
-        est.observe(1000, 2, dt, false);
-        assert!(est.mu().is_none());
-        // Backlog dropped by 100 over 1s with 2 workers, no arrivals.
-        // lambda_raw = (delta + mu_prev*running*dt)/dt = (-100 + 0)/1 = -100 -> clamped 0.
-        // observed_drain = lambda*dt - delta = 0 - (-100) = 100 -> mu_raw = 100/(2*1) = 50.
-        est.observe(900, 2, dt, false);
-        assert_eq!(est.mu(), Some(50.0));
+    fn threshold_scale_down_respects_cooldown() {
+        // An AMQP depth of 0 can mean "all messages are in flight, unacked".
+        // Dropping a worker on the first such tick is how the pool flaps.
+        let p = ThresholdParams {
+            depth_threshold: 40,
+            ram_ratio_cap: 0.9,
+            min_workers: 0,
+            max_workers: 10,
+            cooldown_ticks: 3,
+        };
+        let at = |ticks_since_change| ThresholdInputs {
+            backlog: 0,
+            running: 2,
+            ram_ratio: 0.5,
+            ticks_since_change,
+        };
+        assert_eq!(decide_threshold(&p, &at(0)), ScalingAction::Hold);
+        assert_eq!(decide_threshold(&p, &at(2)), ScalingAction::Hold);
+        assert_eq!(decide_threshold(&p, &at(3)), ScalingAction::ScaleDown);
+    }
+
+    // --- Probing: the controller's half of the identifiability contract ---
+
+    fn probe_inputs(running: u32, needs_probe: bool) -> SloInputs {
+        SloInputs {
+            backlog: 5_000,
+            running,
+            mu: None,
+            lambda: 0.0,
+            worker_rss: Some(100 * 1024 * 1024),
+            safe_ram_budget: 8 * 1024 * 1024 * 1024,
+            swap_pressure: false,
+            ticks_since_change: 10,
+            needs_probe,
+        }
+    }
+
+    #[test]
+    fn probes_down_when_pinned_at_the_ceiling_without_mu() {
+        // At max_workers with mu still unknown, holding forever would freeze the
+        // worker count and mu could never become observable.
+        let mut p = slo_params();
+        p.max_workers = 4;
+        let d = decide_slo(&p, &probe_inputs(4, true));
+        assert_eq!(d.action, ScalingAction::ScaleDown);
+        assert!(d.probing, "the step down is a probe, not an SLO decision");
+    }
+
+    #[test]
+    fn does_not_probe_down_when_mu_is_not_wanted() {
+        let mut p = slo_params();
+        p.max_workers = 4;
+        let d = decide_slo(&p, &probe_inputs(4, false));
+        assert_eq!(d.action, ScalingAction::Hold);
+        assert!(!d.probing);
+    }
+
+    #[test]
+    fn probe_never_breaches_the_floor() {
+        let mut p = slo_params();
+        p.max_workers = 2;
+        p.min_workers = 2;
+        let d = decide_slo(&p, &probe_inputs(2, true));
+        assert_eq!(d.action, ScalingAction::Hold);
+    }
+
+    #[test]
+    fn prefers_scaling_up_over_probing_down_when_there_is_room() {
+        let mut p = slo_params();
+        p.max_workers = 10;
+        let d = decide_slo(&p, &probe_inputs(3, true));
+        assert_eq!(d.action, ScalingAction::ScaleUp);
+    }
+
+    #[test]
+    fn never_probes_an_empty_queue() {
+        let mut p = slo_params();
+        p.max_workers = 4;
+        let mut i = probe_inputs(4, true);
+        i.backlog = 0;
+        assert_eq!(decide_slo(&p, &i).action, ScalingAction::Hold);
     }
 }

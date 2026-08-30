@@ -552,6 +552,7 @@ dependencies = [
  "lapin",
  "nix",
  "serde",
+ "serde_json",
  "shell-words",
  "sysinfo",
  "thiserror",

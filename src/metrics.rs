@@ -21,8 +21,13 @@ pub struct ProgramSnapshot {
     pub feasibility_gap: u64,
     pub mu: f64,
     pub lambda: f64,
+    /// 0 = none, 1 = broker-measured, 2 = regression. See `estimator::Source`.
+    pub mu_source: u64,
+    /// 1 while this tick's action was an identifiability probe.
+    pub probing: u64,
     pub scale_up_total: u64,
     pub scale_down_total: u64,
+    pub probe_total: u64,
 }
 
 #[derive(Default)]
@@ -98,6 +103,22 @@ impl Metrics {
         block(
             &mut s,
             &progs,
+            "effiqueue_mu_source",
+            "gauge",
+            "How mu is being measured: 0 none, 1 broker rates, 2 regression.",
+            |p| p.mu_source.to_string(),
+        );
+        block(
+            &mut s,
+            &progs,
+            "effiqueue_probing",
+            "gauge",
+            "1 while the controller is perturbing worker count to identify mu.",
+            |p| p.probing.to_string(),
+        );
+        block(
+            &mut s,
+            &progs,
             "effiqueue_scale_up_total",
             "counter",
             "Total scale-ups.",
@@ -110,6 +131,14 @@ impl Metrics {
             "counter",
             "Total scale-downs.",
             |p| p.scale_down_total.to_string(),
+        );
+        block(
+            &mut s,
+            &progs,
+            "effiqueue_probe_total",
+            "counter",
+            "Total identifiability probes.",
+            |p| p.probe_total.to_string(),
         );
         s
     }
@@ -149,16 +178,123 @@ pub async fn serve(addr: String, metrics: Arc<Metrics>) {
                 continue;
             }
         };
-        let body = metrics.render();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            let _ = sock.read(&mut buf).await; // drain request (best-effort)
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
+            let read = sock.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..read]);
+            let path = request
+                .split_whitespace()
+                .nth(1)
+                .and_then(|p| p.split('?').next())
+                .unwrap_or("");
+            // Render only for the real path, so a stray probe on / does not get
+            // mistaken for a working scrape target.
+            let resp = match path {
+                "/metrics" => {
+                    let body = metrics.render();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                }
+                "/" => {
+                    let body = "effiQueue: metrics are at /metrics\n";
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                }
+                _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+            };
             let _ = sock.write_all(resp.as_bytes()).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(name: &str) -> ProgramSnapshot {
+        ProgramSnapshot {
+            name: Arc::from(name),
+            workers: 4,
+            backlog: 1200,
+            workers_needed: 7,
+            workers_capacity: 24,
+            feasibility_gap: 0,
+            mu: 8.25,
+            lambda: 200.0,
+            mu_source: 1,
+            probing: 0,
+            scale_up_total: 12,
+            scale_down_total: 3,
+            probe_total: 2,
+        }
+    }
+
+    #[test]
+    fn renders_every_series_with_a_program_label() {
+        let m = Metrics::default();
+        m.set(vec![snapshot("consumer_00")]);
+        let out = m.render();
+        for series in [
+            "effiqueue_workers",
+            "effiqueue_backlog",
+            "effiqueue_workers_needed",
+            "effiqueue_workers_capacity",
+            "effiqueue_feasibility_gap",
+            "effiqueue_mu",
+            "effiqueue_lambda",
+            "effiqueue_mu_source",
+            "effiqueue_probing",
+            "effiqueue_scale_up_total",
+            "effiqueue_scale_down_total",
+            "effiqueue_probe_total",
+        ] {
+            assert!(
+                out.contains(&format!("# TYPE {series} ")),
+                "missing {series}"
+            );
+            assert!(
+                out.contains(&format!("{series}{{program=\"consumer_00\"}} ")),
+                "missing labelled sample for {series}"
+            );
+        }
+    }
+
+    #[test]
+    fn escapes_quotes_and_backslashes_in_labels() {
+        let m = Metrics::default();
+        m.set(vec![snapshot(r#"we"ird\name"#)]);
+        let out = m.render();
+        assert!(out.contains(r#"program="we\"ird\\name""#), "got: {out}");
+    }
+
+    #[test]
+    fn renders_one_sample_per_program() {
+        let m = Metrics::default();
+        m.set(vec![snapshot("a"), snapshot("b")]);
+        let out = m.render();
+        assert_eq!(out.matches("effiqueue_workers{").count(), 2);
+        assert_eq!(out.matches("# TYPE effiqueue_workers ").count(), 1);
+        assert!(out.contains(r#"effiqueue_workers{program="a"}"#));
+        assert!(out.contains(r#"effiqueue_workers{program="b"}"#));
+    }
+
+    #[test]
+    fn negative_workers_needed_survives_the_round_trip() {
+        // -1 is the documented "not measured yet" sentinel.
+        let m = Metrics::default();
+        let mut s = snapshot("p");
+        s.workers_needed = -1;
+        m.set(vec![s]);
+        assert!(m
+            .render()
+            .contains(r#"effiqueue_workers_needed{program="p"} -1"#));
     }
 }

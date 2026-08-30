@@ -1,4 +1,6 @@
 mod config;
+mod estimator;
+mod management;
 mod metrics;
 mod platform;
 mod policy;
@@ -8,7 +10,7 @@ mod worker;
 
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(name = "effiqueue", version, about)]
@@ -31,6 +33,11 @@ enum Cmd {
     ValidateConfig,
 }
 
+/// How often the feasibility gap is re-logged at WARN while it persists.
+/// Between those it stays at DEBUG so a genuinely under-provisioned host does
+/// not drown its own logs.
+const GAP_RELOG_TICKS: u32 = 30;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -42,6 +49,9 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let mut cfgs = config::load_all(&cli.config)?;
+    if cfgs.is_empty() {
+        anyhow::bail!("no programs defined in {}", cli.config);
+    }
     if let Some(m) = cli.mode.as_deref() {
         let mode = match m {
             "slo" => config::Mode::Slo,
@@ -85,6 +95,7 @@ fn log_config(cfg: &config::Config) {
         slo_drain_time = ?cfg.slo_drain_time,
         ram_budget = ?cfg.ram_budget,
         ram_headroom = ?cfg.ram_headroom,
+        management = cfg.management,
         "program configuration"
     );
 }
@@ -107,23 +118,75 @@ fn ram_pool_budget(
 }
 
 /// Emit the signature Feasibility Gap readout as a structured event (DESIGN §3.2).
-fn emit_feasibility_gap(program: &str, gap: &policy::FeasibilityGap, mu: Option<f64>, lambda: f64) {
+fn emit_feasibility_gap(
+    program: &str,
+    gap: &policy::FeasibilityGap,
+    mu: Option<f64>,
+    lambda: f64,
+    loud: bool,
+) {
     let best_drain = match gap.best_drain {
         Some(d) => format!("{:.0}s", d.as_secs_f64()),
         None => "infinite (can't keep up: mu*capacity <= lambda)".to_string(),
     };
-    tracing::warn!(
-        program,
-        workers_needed = gap.workers_needed,
-        workers_capacity = gap.workers_capacity,
-        feasibility_gap = gap.gap_workers,
-        gap_gib = bytes_to_gib(gap.gap_bytes),
-        best_drain = %best_drain,
-        mu = ?mu,
-        lambda,
-        slo_s = gap.slo_drain_time.as_secs(),
-        "feasibility_gap: SLO physically unreachable on this host"
-    );
+    macro_rules! event {
+        ($level:ident) => {
+            tracing::$level!(
+                program,
+                workers_needed = gap.workers_needed,
+                workers_capacity = gap.workers_capacity,
+                feasibility_gap = gap.gap_workers,
+                gap_gib = bytes_to_gib(gap.gap_bytes),
+                best_drain = %best_drain,
+                mu = ?mu,
+                lambda,
+                slo_s = gap.slo_drain_time.as_secs(),
+                "feasibility_gap: SLO physically unreachable on this host"
+            )
+        };
+    }
+    if loud {
+        event!(warn);
+    } else {
+        event!(debug);
+    }
+}
+
+/// Resolve the management endpoint for a program, if one is wanted and derivable.
+fn build_management_client(cfg: &config::Config) -> Option<management::ManagementClient> {
+    if !cfg.management {
+        tracing::info!(program = %cfg.process_name, "management API disabled by config");
+        return None;
+    }
+    let result = match cfg.management_url.as_deref() {
+        Some(url) => management::ManagementClient::from_override(url, &cfg.queue_connection)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        None => management::ManagementClient::from_amqp_uri(&cfg.queue_connection)
+            .map_err(|e| e.to_string()),
+    };
+    match result {
+        Ok(Some(client)) => {
+            tracing::info!(
+                program = %cfg.process_name,
+                endpoint = %client.endpoint(),
+                "management API configured; mu and lambda will be measured directly"
+            );
+            Some(client)
+        }
+        Ok(None) => {
+            tracing::info!(
+                program = %cfg.process_name,
+                "no plaintext management endpoint derivable (amqps); using the regression estimator. \
+                 Set management_url to point at one."
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(program = %cfg.process_name, error = %e, "management API not configured; using the regression estimator");
+            None
+        }
+    }
 }
 
 /// Per-program runtime state carried across ticks.
@@ -132,15 +195,48 @@ struct Prog {
     name: Arc<str>,
     source: rabbitmq_connector::RabbitSource,
     pool: worker::WorkerPool,
-    est: policy::Estimators,
+    est: estimator::Estimator,
     running_in_window: u32,
     expected_running: u32,
     ticks_since_change: u32,
+    ticks_since_gap_log: u32,
+    gap_active: bool,
     scale_up_total: u64,
     scale_down_total: u64,
+    probe_total: u64,
+}
+
+/// Resolve once, and wait for whichever shutdown signal the platform offers.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // SIGTERM is what `docker stop`, `systemctl stop` and a bare `kill` send.
+        // Without it effiQueue would exit without draining and leave the worker
+        // processes running.
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot install a SIGTERM handler; Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => tracing::info!("SIGTERM received"),
+            _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Ctrl-C received");
+    }
 }
 
 async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
+    // These are host-wide, not per-program: the RAM budget is shared by
+    // construction, and one process serves one metrics endpoint on one cadence.
     let dt = cfgs[0].poll_interval;
     let drain_timeout = cfgs[0].drain_timeout;
     let ram_budget = cfgs[0].ram_budget;
@@ -157,10 +253,11 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
         .map(|cfg| {
             let pool =
                 worker::WorkerPool::new(cfg.command.clone(), cfg.process_name.clone(), cfg.shell);
-            let est = policy::Estimators::new(cfg.alpha_mu, cfg.alpha_lambda);
+            let est = estimator::Estimator::new(cfg.alpha_mu, cfg.alpha_lambda);
             let source = rabbitmq_connector::RabbitSource::new(
                 cfg.queue_connection.clone(),
                 cfg.queue_name.clone(),
+                build_management_client(&cfg),
             );
             let name: Arc<str> = Arc::from(cfg.process_name.as_str());
             let ticks = cfg.cooldown_ticks;
@@ -173,8 +270,11 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
                 running_in_window: 0,
                 expected_running: 0,
                 ticks_since_change: ticks,
+                ticks_since_gap_log: GAP_RELOG_TICKS,
+                gap_active: false,
                 scale_up_total: 0,
                 scale_down_total: 0,
+                probe_total: 0,
             }
         })
         .collect();
@@ -185,11 +285,30 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
     }
 
     let mut probe = system_info::ResourceProbe::new();
+    // The estimator must divide by the time that actually elapsed. A scale-down
+    // tick used to take drain_timeout longer than poll_interval, which silently
+    // corrupted every rate derived from it.
+    let mut last_tick = Instant::now();
 
     loop {
+        let elapsed = last_tick.elapsed();
+        last_tick = Instant::now();
+
         for p in progs.iter_mut() {
-            for (id, status) in p.pool.reap_exited() {
-                tracing::info!(program = %p.cfg.process_name, worker_id = id, ?status, "worker exited on its own");
+            for w in p.pool.reap_exited() {
+                if w.crashed {
+                    tracing::warn!(
+                        program = %p.cfg.process_name, worker_id = w.id, pid = w.pid,
+                        status = ?w.status, uptime_s = w.uptime.as_secs_f64(),
+                        "worker exited almost immediately (treated as a crash)"
+                    );
+                } else {
+                    tracing::info!(
+                        program = %p.cfg.process_name, worker_id = w.id, pid = w.pid,
+                        status = ?w.status, uptime_s = w.uptime.as_secs_f64(),
+                        "worker exited on its own"
+                    );
+                }
             }
         }
 
@@ -208,18 +327,24 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
             (host, rss)
         });
 
-        // Per-program pool RSS (basis for the shared, host-wide RAM budget).
-        let prog_rss: Vec<u64> = progs
+        // Per-program pool RSS (basis for the shared, host-wide RAM budget) and
+        // the per-worker figure that sizes capacity.
+        let prog_rss: Vec<(u64, Option<u64>)> = progs
             .iter()
             .map(|p| {
-                p.pool
+                let values: Vec<u64> = p
+                    .pool
                     .pids()
                     .iter()
                     .filter_map(|pid| rss_map.get(pid).copied())
-                    .sum()
+                    .collect();
+                // Size capacity off the LARGEST worker, not the mean. A worker
+                // spawned seconds ago has barely faulted its pages in, and
+                // averaging it in would overstate how many more fit.
+                (values.iter().sum(), values.iter().copied().max())
             })
             .collect();
-        let total_worker_rss: u64 = prog_rss.iter().sum();
+        let total_worker_rss: u64 = prog_rss.iter().map(|(sum, _)| sum).sum();
         let safe_ram_budget = ram_pool_budget(ram_budget, ram_headroom, &host, total_worker_rss);
         let swap_pressure =
             host.total_swap > 0 && host.used_swap.saturating_mul(5) > host.total_swap;
@@ -235,6 +360,7 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
             swap_used_gib = bytes_to_gib(host.used_swap),
             budget_gib = bytes_to_gib(safe_ram_budget),
             worker_rss_gib = bytes_to_gib(total_worker_rss),
+            tick_s = elapsed.as_secs_f64(),
             "host and budget"
         );
 
@@ -246,13 +372,15 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
         for (idx, p) in progs.iter_mut().enumerate() {
             let running = p.pool.len() as u32;
             let interference = running != p.expected_running;
-            let this_rss = prog_rss[idx];
-            let worker_rss = (running > 0).then(|| this_rss / running as u64);
+            let (this_rss, worker_rss) = prog_rss[idx];
 
-            let backlog = match p.source.queue_depth().await {
-                Ok(depth) => depth,
+            let reading = match p.source.read().await {
+                Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(program = %p.cfg.process_name, error = %e, "MetricSource/RabbitMQ error; skipping this program this tick");
+                    // The estimator must not see this gap as a single window, so
+                    // its backlog baseline is reset rather than left stale.
+                    p.est.forget_backlog();
                     p.running_in_window = running;
                     p.expected_running = running;
                     snapshots.push(metrics::ProgramSnapshot {
@@ -264,17 +392,26 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
                         feasibility_gap: 0,
                         mu: p.est.mu().unwrap_or(0.0),
                         lambda: p.est.lambda(),
+                        mu_source: p.est.source() as u64,
+                        probing: 0,
                         scale_up_total: p.scale_up_total,
                         scale_down_total: p.scale_down_total,
+                        probe_total: p.probe_total,
                     });
                     continue;
                 }
             };
+            let backlog = reading.backlog;
 
-            p.est
-                .observe(backlog, p.running_in_window, dt, interference);
+            p.est.observe(&estimator::Observation {
+                backlog,
+                running: p.running_in_window,
+                dt: elapsed,
+                interference,
+                rates: reading.rates,
+            });
 
-            let (action, m_needed, m_capacity, m_gap) = match p.cfg.mode {
+            let (action, probing, m_needed, m_capacity, m_gap) = match p.cfg.mode {
                 config::Mode::Slo => {
                     let others_rss = total_worker_rss.saturating_sub(this_rss);
                     let eff_budget = safe_ram_budget
@@ -297,19 +434,46 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
                         safe_ram_budget: eff_budget,
                         swap_pressure,
                         ticks_since_change: p.ticks_since_change,
+                        needs_probe: p.est.needs_probe(),
                     };
                     let d = policy::decide_slo(&params, &inputs);
-                    if let Some(gap) = &d.feasibility_gap {
-                        emit_feasibility_gap(&p.cfg.process_name, gap, p.est.mu(), p.est.lambda());
+                    match &d.feasibility_gap {
+                        Some(gap) => {
+                            // Loud on the first tick of a gap, then periodically.
+                            let loud = !p.gap_active || p.ticks_since_gap_log >= GAP_RELOG_TICKS;
+                            emit_feasibility_gap(
+                                &p.cfg.process_name,
+                                gap,
+                                p.est.mu(),
+                                p.est.lambda(),
+                                loud,
+                            );
+                            p.ticks_since_gap_log = if loud {
+                                0
+                            } else {
+                                p.ticks_since_gap_log.saturating_add(1)
+                            };
+                            p.gap_active = true;
+                        }
+                        None => {
+                            if p.gap_active {
+                                tracing::info!(program = %p.cfg.process_name, "feasibility gap cleared: the SLO now fits on this host");
+                            }
+                            p.gap_active = false;
+                            p.ticks_since_gap_log = GAP_RELOG_TICKS;
+                        }
                     }
                     tracing::debug!(
                         program = %p.cfg.process_name,
                         backlog,
                         mu = ?p.est.mu(),
+                        mu_source = ?p.est.source(),
                         lambda = p.est.lambda(),
+                        spread = p.est.spread(),
                         workers_needed = ?d.workers_needed,
                         workers_capacity = d.workers_capacity,
                         action = ?d.action,
+                        probing = d.probing,
                         "SLO decision"
                     );
                     let needed = d.workers_needed.map(|n| n as i64).unwrap_or(-1);
@@ -318,7 +482,7 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
                         .as_ref()
                         .map(|g| g.gap_workers as u64)
                         .unwrap_or(0);
-                    (d.action, needed, d.workers_capacity as u64, gap)
+                    (d.action, d.probing, needed, d.workers_capacity as u64, gap)
                 }
                 config::Mode::Threshold => {
                     let params = policy::ThresholdParams {
@@ -326,6 +490,7 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
                         ram_ratio_cap: p.cfg.ram_ratio_cap,
                         min_workers: p.cfg.min_workers,
                         max_workers: p.cfg.max_workers,
+                        cooldown_ticks: p.cfg.cooldown_ticks,
                     };
                     let a = policy::decide_threshold(
                         &params,
@@ -333,29 +498,53 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
                             backlog,
                             running,
                             ram_ratio,
+                            ticks_since_change: p.ticks_since_change,
                         },
                     );
                     tracing::debug!(program = %p.cfg.process_name, backlog, running, ram_ratio, action = ?a, "threshold decision");
-                    (a, -1i64, 0u64, 0u64)
+                    (a, false, -1i64, 0u64, 0u64)
                 }
             };
 
             match action {
-                policy::ScalingAction::ScaleUp => {
-                    match p.pool.spawn_one() {
-                        Ok(_) => {
-                            committed_extra += worker_rss.unwrap_or(0);
-                            p.scale_up_total += 1;
+                policy::ScalingAction::ScaleUp => match p.pool.spawn_one() {
+                    Ok(Some(_)) => {
+                        committed_extra += worker_rss.unwrap_or(0);
+                        p.scale_up_total += 1;
+                        if probing {
+                            p.probe_total += 1;
                         }
-                        Err(e) => {
-                            tracing::error!(program = %p.cfg.process_name, error = %e, "failed to start worker")
-                        }
+                        p.ticks_since_change = 0;
                     }
-                    p.ticks_since_change = 0;
-                }
+                    Ok(None) => {
+                        // Crash-loop back-off is active; leave the cooldown clock
+                        // running so we do not look like we just scaled.
+                        tracing::debug!(
+                            program = %p.cfg.process_name,
+                            backoff_s = p.pool.spawn_backoff_remaining().map(|d| d.as_secs()),
+                            "scale-up suppressed by the crash-loop back-off"
+                        );
+                        p.ticks_since_change = p.ticks_since_change.saturating_add(1);
+                    }
+                    Err(e) => {
+                        tracing::error!(program = %p.cfg.process_name, error = %e, "failed to start worker");
+                        p.ticks_since_change = p.ticks_since_change.saturating_add(1);
+                    }
+                },
                 policy::ScalingAction::ScaleDown => {
-                    p.pool.stop_one(drain_timeout).await;
-                    p.scale_down_total += 1;
+                    if let Some(w) = p.pool.detach_one() {
+                        if probing {
+                            tracing::info!(
+                                program = %p.cfg.process_name, worker_id = w.id,
+                                "stepping one worker down to make mu observable (identifiability probe)"
+                            );
+                            p.probe_total += 1;
+                        }
+                        // Drain in the background: a 30s drain must not stall a
+                        // 10s control loop, nor the other programs sharing it.
+                        tokio::spawn(worker::drain_detached(w, drain_timeout));
+                        p.scale_down_total += 1;
+                    }
                     p.ticks_since_change = 0;
                 }
                 policy::ScalingAction::Hold => {
@@ -376,8 +565,11 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
                 feasibility_gap: m_gap,
                 mu: p.est.mu().unwrap_or(0.0),
                 lambda: p.est.lambda(),
+                mu_source: p.est.source() as u64,
+                probing: u64::from(probing),
                 scale_up_total: p.scale_up_total,
                 scale_down_total: p.scale_down_total,
+                probe_total: p.probe_total,
             });
         }
 
@@ -385,13 +577,14 @@ async fn run(cfgs: Vec<config::Config>) -> anyhow::Result<()> {
 
         tokio::select! {
             _ = tokio::time::sleep(dt) => {}
-            _ = tokio::signal::ctrl_c() => {
+            _ = shutdown_signal() => {
                 tracing::info!("shutdown signal received; draining workers");
                 for p in progs.iter_mut() {
                     if !p.pool.is_empty() {
                         p.pool.shutdown_all(drain_timeout).await;
                     }
                 }
+                tracing::info!("all workers drained; exiting");
                 break;
             }
         }

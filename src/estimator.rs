@@ -177,40 +177,58 @@ impl Estimator {
             return;
         }
 
-        // Preferred path: the broker measured both rates for us.
+        // Preferred path: the broker measured the rates for us.
+        let broker_lambda = o
+            .rates
+            .map(|r| r.publish_rate)
+            .filter(|rate| rate.is_finite() && *rate >= 0.0);
+        if let Some(rate) = broker_lambda {
+            self.lambda.update(rate);
+        }
+        let mut mu_from_broker = false;
         if let Some(rates) = o.rates {
-            if rates.publish_rate >= 0.0 {
-                self.lambda.update(rates.publish_rate);
-            }
             if o.running > 0 && rates.ack_rate > 0.0 {
                 self.mu.update(rates.ack_rate / o.running as f64);
                 self.source = Source::Direct;
                 self.direct_stale = 0;
+                mu_from_broker = true;
             }
-            // Keep collecting regression samples so the fallback stays warm if
-            // the management API disappears mid-run. `push_sample` advances the
-            // backlog baseline itself — doing it here first would difference the
-            // reading against itself and fill the window with zeros.
-            self.push_sample(o, dt_s);
-            return;
         }
 
-        // No broker rates this window.
+        // Always record the sample: it keeps the fallback warm while the broker
+        // is healthy, and it is the only signal when the broker is not.
         self.push_sample(o, dt_s);
-        let fitted = self.refit();
 
-        if fitted {
-            self.source = Source::Regression;
+        if mu_from_broker {
             return;
         }
-        if self.source == Source::Direct {
-            // The estimate is still the broker's, but the broker has gone quiet.
-            // Reporting it as `Direct` forever would misstate where the number
-            // came from AND permanently suppress probing, since a live direct
-            // source never needs one.
-            self.direct_stale = self.direct_stale.saturating_add(1);
-            if self.direct_stale > DIRECT_GRACE_WINDOWS {
-                self.source = Source::None;
+
+        // Either there were no broker rates at all, or the broker answered but
+        // attributed no throughput to acknowledge — some deployments and some
+        // consumption patterns simply do not populate `ack_details`. Falling
+        // through to the fit means a broker that reports differently than
+        // expected degrades the estimate instead of blinding it.
+        match self.fit() {
+            Some((mu_hat, lambda_hat)) => {
+                self.mu.update(mu_hat);
+                // The broker's own lambda is better than a fitted intercept.
+                if broker_lambda.is_none() {
+                    self.lambda.update(lambda_hat.max(0.0));
+                }
+                self.source = Source::Regression;
+            }
+            None => {
+                if self.source == Source::Direct {
+                    // The estimate is still the broker's, but the broker has
+                    // gone quiet. Reporting it as `Direct` forever would
+                    // misstate where the number came from AND permanently
+                    // suppress probing, since a live direct source never needs
+                    // one.
+                    self.direct_stale = self.direct_stale.saturating_add(1);
+                    if self.direct_stale > DIRECT_GRACE_WINDOWS {
+                        self.source = Source::None;
+                    }
+                }
             }
         }
     }
@@ -247,10 +265,10 @@ impl Estimator {
     }
 
     /// Ordinary least squares of `y = lambda - mu*n` over the window.
-    /// Returns whether a trustworthy fit was produced.
-    fn refit(&mut self) -> bool {
+    /// Returns `(mu, lambda)` only when the fit is trustworthy.
+    fn fit(&self) -> Option<(f64, f64)> {
         if self.window.len() < MIN_SAMPLES {
-            return false;
+            return None;
         }
         let count = self.window.len() as f64;
         let n_mean = self.window.iter().map(|s| s.n).sum::<f64>() / count;
@@ -259,7 +277,7 @@ impl Estimator {
 
         // `n` never moved enough — mu is not identifiable from this window.
         if sxx < MIN_SPREAD {
-            return false;
+            return None;
         }
         let sxy: f64 = self
             .window
@@ -268,21 +286,18 @@ impl Estimator {
             .sum();
         let slope = sxy / sxx;
         if !slope.is_finite() {
-            return false;
+            return None;
         }
         let mu_hat = -slope;
         let lambda_hat = y_mean - slope * n_mean;
 
-        // A non-positive slope means "more workers drained less", which is noise,
-        // not physics. Reject rather than publish a nonsense estimate.
-        // `is_finite` runs first so the comparison below never sees a NaN.
+        // A non-positive slope means "more workers drained less", which is
+        // noise, not physics. Reject rather than publish a nonsense estimate.
+        // `is_finite` runs first so the comparison never sees a NaN.
         if !mu_hat.is_finite() || !lambda_hat.is_finite() || mu_hat <= 0.0 {
-            return false;
+            return None;
         }
-
-        self.mu.update(mu_hat);
-        self.lambda.update(lambda_hat.max(0.0));
-        true
+        Some((mu_hat, lambda_hat))
     }
 
     /// Measured throughput per worker, or `None` while it is not identifiable.
@@ -665,6 +680,47 @@ mod tests {
         assert!(
             est.needs_probe(),
             "with the broker gone and no fit, the controller must be told to probe"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_fit_when_the_broker_reports_no_acks() {
+        // A reachable broker that never attributes acknowledgements would
+        // otherwise pin us on the direct path with mu permanently unknown:
+        // `rates` is Some every window, so the fit would never run and the
+        // staleness counter would never advance. Not every deployment or
+        // consumption pattern populates `ack_details`.
+        let mut est = Estimator::new(0.5, 0.5);
+        let dt_s = DT.as_secs_f64();
+        let (mu_true, lambda_true) = (8.0, 200.0);
+        let mut backlog = 50_000.0;
+        let mut n_window = 10u32;
+
+        for i in 0..60u32 {
+            est.observe(&Observation {
+                backlog: backlog as u32,
+                running: n_window,
+                dt: DT,
+                interference: false,
+                rates: Some(BrokerRates {
+                    ack_rate: 0.0, // broker is up, but reports no acks
+                    publish_rate: lambda_true,
+                }),
+            });
+            let n_next = if i % 2 == 0 { 11 } else { 10 };
+            backlog = (backlog + lambda_true * dt_s - mu_true * n_next as f64 * dt_s).max(1.0);
+            if backlog > 400_000.0 {
+                backlog = 20_000.0;
+            }
+            n_window = n_next;
+        }
+        assert_close(est.mu(), 8.0, 1.0, "mu with a broker that reports no acks");
+        assert_eq!(est.source(), Source::Regression);
+        // The broker's own publish rate is still better than a fitted intercept.
+        assert!(
+            (est.lambda() - lambda_true).abs() < 1.0,
+            "lambda should come from the broker, got {}",
+            est.lambda()
         );
     }
 

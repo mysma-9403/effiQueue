@@ -153,6 +153,10 @@ pub struct WorkerPool {
     consecutive_crashes: u32,
     /// Spawning is suppressed until this instant.
     blocked_until: Option<Instant>,
+    /// Workers handed off for background draining: `(pid, give-up deadline)`.
+    /// They no longer count towards `len()`, but they are still resident, so
+    /// they must keep counting towards RAM.
+    draining: Vec<(u32, Instant)>,
 }
 
 impl WorkerPool {
@@ -165,6 +169,7 @@ impl WorkerPool {
             shell,
             consecutive_crashes: 0,
             blocked_until: None,
+            draining: Vec::new(),
         }
     }
 
@@ -177,9 +182,18 @@ impl WorkerPool {
         self.workers.is_empty()
     }
 
-    /// PIDs of all live workers (basis for per-PID RSS sampling).
+    /// PIDs to sample RSS for: live workers **plus** those still draining.
+    ///
+    /// A draining worker has left `len()` but has not left memory. Omitting it
+    /// would understate the pool's footprint for up to `drain_timeout` — three
+    /// ticks at the defaults — and under an explicit `ram_budget` that lets the
+    /// controller scale up into RAM that is still held.
     pub fn pids(&self) -> Vec<u32> {
-        self.workers.iter().map(|w| w.pid).collect()
+        self.workers
+            .iter()
+            .map(|w| w.pid)
+            .chain(self.draining.iter().map(|(pid, _)| *pid))
+            .collect()
     }
 
     /// Whether spawning is currently allowed. A command that dies on startup
@@ -215,13 +229,24 @@ impl WorkerPool {
     /// Remove the newest worker from the registry and hand it to the caller.
     ///
     /// The pool's count drops immediately while the caller drains the process in
-    /// the background, so a slow drain never stalls the control loop.
-    pub fn detach_one(&mut self) -> Option<TrackedWorker> {
-        self.workers.pop()
+    /// the background, so a slow drain never stalls the control loop. The PID is
+    /// remembered until `drain_timeout` elapses so its memory stays accounted
+    /// for while it winds down.
+    pub fn detach_one(&mut self, drain_timeout: Duration) -> Option<TrackedWorker> {
+        let w = self.workers.pop()?;
+        self.draining.push((w.pid, Instant::now() + drain_timeout));
+        Some(w)
+    }
+
+    /// Forget draining workers past their deadline; by then they are killed.
+    fn prune_draining(&mut self) {
+        let now = Instant::now();
+        self.draining.retain(|(_, deadline)| now < *deadline);
     }
 
     /// Remove workers that exited on their own and update crash-loop state.
     pub fn reap_exited(&mut self) -> Vec<ExitedWorker> {
+        self.prune_draining();
         let mut dead = Vec::new();
         let mut i = 0;
         while i < self.workers.len() {
@@ -273,6 +298,7 @@ impl WorkerPool {
     /// Gracefully stop every worker (used on daemon shutdown). Workers are
     /// drained concurrently, so shutdown costs one `drain_timeout`, not N.
     pub async fn shutdown_all(&mut self, drain_timeout: Duration) {
+        self.draining.clear();
         let mut set = tokio::task::JoinSet::new();
         for mut w in std::mem::take(&mut self.workers) {
             set.spawn(async move {
@@ -315,7 +341,9 @@ mod tests {
         let mut pool = sleeper_pool();
         pool.spawn_one().unwrap().expect("spawn allowed");
         assert_eq!(pool.len(), 1);
-        let w = pool.detach_one().expect("worker detached");
+        let w = pool
+            .detach_one(Duration::from_secs(5))
+            .expect("worker detached");
         // Detaching drops the count immediately; the drain happens off the loop.
         assert_eq!(pool.len(), 0);
         let mut w = w;
@@ -336,6 +364,37 @@ mod tests {
         pool.shutdown_all(Duration::from_millis(200)).await;
         assert_eq!(pool.len(), 0);
         assert!(pool.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_draining_worker_still_counts_towards_ram() {
+        // Detaching drops the worker from len() so the control loop is not
+        // blocked, but the process is still resident. If its pid left pids()
+        // too, its RSS would vanish from the budget for a whole drain_timeout
+        // and the controller could scale up into memory that is still held.
+        let mut pool = sleeper_pool();
+        pool.spawn_one().unwrap().expect("spawn allowed");
+        pool.spawn_one().unwrap().expect("spawn allowed");
+        assert_eq!(pool.pids().len(), 2);
+
+        let w = pool.detach_one(Duration::from_secs(30)).expect("detached");
+        assert_eq!(pool.len(), 1, "detached worker leaves the live count");
+        assert_eq!(
+            pool.pids().len(),
+            2,
+            "detached worker must stay in RAM accounting while it drains"
+        );
+        assert!(pool.pids().contains(&w.pid));
+
+        // Past the deadline it is gone for good.
+        pool.detach_one(Duration::ZERO);
+        pool.reap_exited();
+        assert!(
+            !pool.pids().contains(&w.pid) || pool.pids().len() < 2,
+            "expired drains must be pruned"
+        );
+        drain_detached(w, Duration::from_millis(200)).await;
+        pool.shutdown_all(Duration::from_millis(200)).await;
     }
 
     #[tokio::test]
